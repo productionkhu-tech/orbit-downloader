@@ -22,5 +22,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.removeAllListeners('update-ready');
     ipcRenderer.on('update-ready', (_event, data) => callback(data));
   },
+  onUpdateStatus: (callback) => {
+    ipcRenderer.removeAllListeners('update-status');
+    ipcRenderer.on('update-status', (_event, data) => callback(data));
+  },
+  onUpdateApplied: (callback) => {
+    ipcRenderer.removeAllListeners('update-applied');
+    ipcRenderer.on('update-applied', (_event, data) => callback(data));
+  },
   restartForUpdate: () => ipcRenderer.invoke('restart-for-update'),
+  checkUpdateNow: () => ipcRenderer.invoke('check-update-now'),
 });

@@ -1,8 +1,10 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, clipboard } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Notification } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Store from 'electron-store';
 import { spawn } from 'child_process';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import os from 'os';
 import fs from 'fs';
 
@@ -57,60 +59,135 @@ async function fetchLatestRelease() {
   }
 }
 
-async function downloadToFile(url, dest) {
+async function downloadToFile(url, dest, onProgress) {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'orbit-downloader-updater', Accept: 'application/octet-stream' },
     redirect: 'follow',
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(dest, buf);
+  const total = parseInt(res.headers.get('content-length') || '0', 10);
+  let received = 0;
+  const file = fs.createWriteStream(dest);
+  const reader = Readable.fromWeb(res.body);
+  reader.on('data', (chunk) => {
+    received += chunk.length;
+    if (onProgress) onProgress(received, total);
+  });
+  await pipeline(reader, file);
+}
+
+function sendUpdateStatus(status, extra = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update-status', { status, ...extra });
+  }
 }
 
 async function checkForUpdate() {
-  if (pendingUpdate) return; // already downloaded, waiting for restart
+  if (pendingUpdate) {
+    sendUpdateStatus('ready', { version: pendingUpdate.version });
+    return;
+  }
+  sendUpdateStatus('checking');
   const release = await fetchLatestRelease();
-  if (!release || !release.tag_name) return;
+  if (!release || !release.tag_name) {
+    sendUpdateStatus('error', { message: 'GitHub Releases API에 도달하지 못했어요.' });
+    return;
+  }
   const latest = release.tag_name.replace(/^v/, '');
   const current = app.getVersion();
-  if (compareSemver(latest, current) <= 0) return;
+  if (compareSemver(latest, current) <= 0) {
+    sendUpdateStatus('current', { version: current });
+    return;
+  }
 
-  const asset = (release.assets || []).find((a) => /OrbitDownloader.*\.exe$/i.test(a.name));
-  if (!asset) return;
+  const asset = (release.assets || []).find((a) => /^OrbitDownloader\.exe$/i.test(a.name));
+  if (!asset) {
+    sendUpdateStatus('error', { message: `릴리즈 v${latest}에 OrbitDownloader.exe 자산이 없습니다.` });
+    return;
+  }
 
   const targetExe = installedExePath();
   const newPath = `${targetExe}.new`;
+  sendUpdateStatus('downloading', { version: latest, received: 0, total: asset.size || 0, percent: 0 });
   try {
     if (fs.existsSync(newPath)) fs.unlinkSync(newPath);
-    await downloadToFile(asset.browser_download_url, newPath);
+    let lastSent = 0;
+    await downloadToFile(asset.browser_download_url, newPath, (received, total) => {
+      const now = Date.now();
+      if (now - lastSent > 300) {
+        lastSent = now;
+        const percent = total ? Math.floor((received / total) * 100) : 0;
+        sendUpdateStatus('downloading', { version: latest, received, total, percent });
+      }
+    });
     pendingUpdate = { version: latest, notes: release.body || '', newExePath: newPath };
+    sendUpdateStatus('ready', { version: latest });
+
+    // System-level notification — visible even when the window is minimized.
+    try {
+      if (Notification.isSupported()) {
+        const n = new Notification({
+          title: 'Orbit Downloader',
+          body: `v${latest} 업데이트가 준비됐어요. 앱을 끄거나 재시작하면 적용됩니다.`,
+          silent: false,
+        });
+        n.on('click', () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show(); mainWindow.focus();
+          }
+        });
+        n.show();
+      }
+    } catch (e) { console.error('[update] notification failed:', e.message); }
+
+    // Keep the legacy event for back-compat with v1.5.x renderers.
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-ready', {
-        version: latest,
-        notes: release.body || '',
-        ready: true,
+        version: latest, notes: release.body || '', ready: true,
       });
     }
   } catch (e) {
+    sendUpdateStatus('error', { message: `다운로드 실패: ${e.message}` });
     console.error('[update] download failed:', e.message);
   }
 }
 
 function startUpdateScheduler() {
-  // First check 5 seconds after launch so it doesn't block startup.
-  setTimeout(checkForUpdate, 5_000);
+  // First check 2 seconds after launch — fast enough to feel responsive,
+  // late enough that the renderer has registered its listeners.
+  setTimeout(checkForUpdate, 2_000);
   setInterval(checkForUpdate, UPDATE_CHECK_INTERVAL_MS);
 }
 
-// On quit, if we've downloaded a new version, fire a detached cmd that
-// waits for this process to exit then swaps the .new file into place.
-function applyPendingUpdateOnExit() {
+// Spawn a detached cmd that, after this process exits:
+//   1) waits a moment for the file lock to release
+//   2) replaces OrbitDownloader.exe with OrbitDownloader.exe.new
+//   3) optionally relaunches the freshly-swapped exe
+// Called on `before-quit` so the user's normal close still applies the update.
+function applyPendingUpdateOnExit({ relaunch }) {
   if (!pendingUpdate) return;
   const target = installedExePath();
   const src = pendingUpdate.newExePath;
   if (!fs.existsSync(src)) return;
-  // ping = small reliable delay (no taskkill / handle inheritance)
-  const cmd = `ping 127.0.0.1 -n 2 >nul & move /Y "${src}" "${target}"`;
+
+  // Remember which version we just installed so the next launch can show a
+  // friendly "updated from X to Y" toast.
+  try {
+    store.set('pendingAppliedFrom', app.getVersion());
+    store.set('pendingAppliedTo', pendingUpdate.version);
+  } catch (_) {}
+
+  const parts = [
+    'ping 127.0.0.1 -n 2 >nul',
+    `move /Y "${src}" "${target}"`,
+  ];
+  if (relaunch) {
+    // Brief extra wait so the freshly written exe is fully flushed to disk.
+    parts.push('ping 127.0.0.1 -n 2 >nul');
+    parts.push(`start "" "${target}"`);
+  }
+  const cmd = parts.join(' & ');
+
   try {
     spawn('cmd', ['/c', cmd], {
       detached: true,
@@ -122,19 +199,36 @@ function applyPendingUpdateOnExit() {
   }
 }
 
+// Was an update applied just before this launch? If so, show a toast.
+function consumePendingAppliedToast() {
+  try {
+    const from = store.get('pendingAppliedFrom');
+    const to = store.get('pendingAppliedTo');
+    const current = app.getVersion();
+    if (from && to && to === current) {
+      store.delete('pendingAppliedFrom');
+      store.delete('pendingAppliedTo');
+      return { from, to };
+    }
+    // If the recorded "to" doesn't match the current running version, the
+    // swap probably failed silently — clear stale state but don't toast.
+    if (from || to) {
+      store.delete('pendingAppliedFrom');
+      store.delete('pendingAppliedTo');
+    }
+  } catch (_) {}
+  return null;
+}
+
 ipcMain.handle('restart-for-update', () => {
   if (!pendingUpdate) return false;
-  applyPendingUpdateOnExit();
-  // Re-launch the installed exe a moment after the swap completes
-  setTimeout(() => {
-    const target = installedExePath();
-    spawn('cmd', ['/c', `ping 127.0.0.1 -n 4 >nul & start "" "${target}"`], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    }).unref();
-    app.quit();
-  }, 200);
+  applyPendingUpdateOnExit({ relaunch: true });
+  setTimeout(() => app.quit(), 200);
+  return true;
+});
+
+ipcMain.handle('check-update-now', async () => {
+  await checkForUpdate();
   return true;
 });
 
@@ -194,6 +288,15 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     if (app.isPackaged) startUpdateScheduler();
+
+    // If we just came back from an auto-applied update, tell the renderer.
+    const applied = consumePendingAppliedToast();
+    if (applied && mainWindow && !mainWindow.isDestroyed()) {
+      // Delay slightly so the renderer has set up its onUpdateApplied listener.
+      setTimeout(() => {
+        mainWindow.webContents.send('update-applied', applied);
+      }, 1500);
+    }
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -233,7 +336,9 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  applyPendingUpdateOnExit();
+  // User closed the app while an update was pending → swap + auto-relaunch
+  // (matches the "끄면 자동으로 새 버전이 실행됨" mental model).
+  applyPendingUpdateOnExit({ relaunch: true });
 });
 
 // ---------------- Config ----------------

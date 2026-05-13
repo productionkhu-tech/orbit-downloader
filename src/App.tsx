@@ -24,7 +24,7 @@ import {
   ArrowRight,
   Globe,
 } from 'lucide-react';
-import type { AppConfig, Quality, UpdateInfo } from './globals';
+import type { AppConfig, Quality, UpdateInfo, UpdateStatus } from './globals';
 
 // ============================================================
 // URL parsing
@@ -311,6 +311,7 @@ function App() {
   const [ytdlpStatus, setYtdlpStatus] = useState<{ installed: boolean; bundled: boolean; version: string } | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ status: 'checking' });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -351,6 +352,10 @@ function App() {
     });
 
     window.electronAPI.onUpdateReady((info) => setPendingUpdate(info));
+    window.electronAPI.onUpdateStatus((status) => setUpdateStatus(status));
+    window.electronAPI.onUpdateApplied(({ from, to }) => {
+      showToast(`업데이트 완료 — v${from} → v${to}`, 'ok');
+    });
   }, []);
 
   useEffect(() => {
@@ -524,21 +529,33 @@ function App() {
               {ytdlpStatus.bundled && <span className="text-[#D97757]">·내장</span>}
             </div>
           )}
-          {pendingUpdate && (
-            <button
-              onClick={() => window.electronAPI?.restartForUpdate()}
-              title={`v${pendingUpdate.version} 다운로드 완료 · 클릭하면 재시작하며 적용`}
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#D97757] text-white text-[11px] font-semibold shadow-[0_1px_4px_rgba(217,119,87,0.4)] hover:bg-[#C9633E] transition-colors active:scale-95"
-            >
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-75 animate-ping" />
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white" />
-              </span>
-              업데이트 준비됨 · 재시작
-            </button>
-          )}
+          <UpdateBadge
+            status={updateStatus}
+            pending={pendingUpdate}
+            onRestart={() => window.electronAPI?.restartForUpdate()}
+            onCheckNow={() => window.electronAPI?.checkUpdateNow()}
+          />
         </div>
       </header>
+
+      {/* ============ Floating download-progress strip (under header) ============ */}
+      {updateStatus.status === 'downloading' && (
+        <div className="shrink-0 px-4 py-2 bg-[#FBEDE5] border-b border-[#D97757]/20 text-[11.5px] text-[#C9633E] flex items-center gap-3">
+          <Loader2 size={12} className="animate-spin shrink-0" />
+          <span className="font-medium whitespace-nowrap">
+            새 버전 v{updateStatus.version} 다운로드 중
+          </span>
+          <div className="flex-1 h-1 rounded-full bg-[#D97757]/15 overflow-hidden">
+            <div
+              className="h-full bg-[#D97757] transition-[width] duration-300"
+              style={{ width: `${updateStatus.percent}%` }}
+            />
+          </div>
+          <span className="tabular-nums font-semibold whitespace-nowrap min-w-[3rem] text-right">
+            {updateStatus.percent}%
+          </span>
+        </div>
+      )}
 
       {/* ============ Settings strip ============ */}
       <div className="shrink-0 h-14 px-6 flex items-center gap-5 border-b border-[#1F1E1B]/[0.06] bg-[#F4F1E8]/40 overflow-x-auto">
@@ -774,6 +791,96 @@ function App() {
 // ============================================================
 // Sub-components
 // ============================================================
+function UpdateBadge({
+  status, pending, onRestart, onCheckNow,
+}: {
+  status: UpdateStatus;
+  pending: UpdateInfo | null;
+  onRestart: () => void;
+  onCheckNow: () => void;
+}) {
+  // Pending update wins over any transient status — always offer the restart action.
+  if (pending) {
+    return (
+      <button
+        onClick={onRestart}
+        title={`v${pending.version} 다운로드 완료 · 클릭하면 재시작하며 적용`}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#D97757] text-white text-[11px] font-semibold shadow-[0_1px_4px_rgba(217,119,87,0.4)] hover:bg-[#C9633E] transition-colors active:scale-95"
+      >
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-75 animate-ping" />
+          <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white" />
+        </span>
+        업데이트 준비됨 · 재시작
+      </button>
+    );
+  }
+
+  const baseClass =
+    'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors';
+
+  switch (status.status) {
+    case 'checking':
+      return (
+        <button
+          onClick={onCheckNow}
+          title="GitHub Releases 확인 중 · 클릭하면 즉시 재확인"
+          className={`${baseClass} bg-[#1F1E1B]/[0.04] text-[#5C5A52] hover:bg-[#1F1E1B]/[0.08]`}
+        >
+          <Loader2 size={11} className="animate-spin" />
+          <span>업데이트 확인 중</span>
+        </button>
+      );
+    case 'downloading':
+      return (
+        <button
+          onClick={onCheckNow}
+          title={`v${status.version} 다운로드 중 (${status.percent}%)`}
+          className={`${baseClass} bg-[#FBEDE5] text-[#C9633E]`}
+        >
+          <Loader2 size={11} className="animate-spin" />
+          <span className="tabular-nums">다운로드 {status.percent}%</span>
+        </button>
+      );
+    case 'current':
+      return (
+        <button
+          onClick={onCheckNow}
+          title={`v${status.version} · 클릭하면 최신 버전 즉시 재확인`}
+          className={`${baseClass} bg-emerald-50 text-emerald-700 hover:bg-emerald-100`}
+        >
+          <CheckCircle2 size={11} />
+          <span>최신 버전</span>
+        </button>
+      );
+    case 'error':
+      return (
+        <button
+          onClick={onCheckNow}
+          title={`업데이트 확인 실패: ${status.message} · 클릭하면 다시 시도`}
+          className={`${baseClass} bg-amber-50 text-amber-700 hover:bg-amber-100`}
+        >
+          <AlertCircle size={11} />
+          <span>업데이트 확인 실패</span>
+        </button>
+      );
+    case 'ready':
+      // 'ready' without pendingUpdate happens if the renderer reconnects later; same UI as pending.
+      return (
+        <button
+          onClick={onRestart}
+          className={`${baseClass} bg-[#D97757] text-white shadow-[0_1px_4px_rgba(217,119,87,0.4)] hover:bg-[#C9633E] font-semibold`}
+        >
+          <span className="relative flex h-1.5 w-1.5">
+            <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-75 animate-ping" />
+            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white" />
+          </span>
+          v{status.version} 준비됨 · 재시작
+        </button>
+      );
+  }
+}
+
 function Separator() {
   return <div className="w-px h-5 bg-[#1F1E1B]/[0.08] shrink-0" />;
 }

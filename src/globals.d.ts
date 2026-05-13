@@ -33,6 +33,18 @@ export interface UpdateInfo {
   ready: boolean;
 }
 
+export type UpdateStatus =
+  | { status: 'checking' }
+  | { status: 'current'; version: string }
+  | { status: 'downloading'; version: string; received: number; total: number; percent: number }
+  | { status: 'ready'; version: string }
+  | { status: 'error'; message: string };
+
+export interface UpdateApplied {
+  from: string;
+  to: string;
+}
+
 declare global {
   const __APP_VERSION__: string;
   const __BUILD_DATE__: string;
@@ -52,7 +64,10 @@ declare global {
       onDownloadProgress: (cb: (data: { id: string; text: string }) => void) => void;
       onDownloadComplete: (cb: (data: { id: string; code: number; cancelled: boolean }) => void) => void;
       onUpdateReady: (cb: (info: UpdateInfo) => void) => void;
+      onUpdateStatus: (cb: (status: UpdateStatus) => void) => void;
+      onUpdateApplied: (cb: (info: UpdateApplied) => void) => void;
       restartForUpdate: () => void;
+      checkUpdateNow: () => Promise<boolean>;
     };
   }
 }
