@@ -1,7 +1,8 @@
+# Auto line-ending normalization for most text files.
+* text=auto
+
 # Windows batch files MUST be CRLF — cmd.exe silently exits on LF endings.
 # Mark as binary so git never normalizes them away from CP949 + CRLF.
+# (More specific rules MUST come after the catch-all above.)
 *.bat -text
 install.template.bat text eol=lf
-
-# Other text files can use auto-detected line endings.
-* text=auto
