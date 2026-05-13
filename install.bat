@@ -32,9 +32,24 @@ if not exist "%INSTALL_DIR%" (
     if errorlevel 1 goto :err_mkdir
 )
 
-REM Clean any leftover partial file from a previous attempt.
-if exist "%EXE_PATH%" del /F /Q "%EXE_PATH%" 2>nul
+REM ---------- Pre-flight: kill running Orbit Downloader so we can overwrite ----------
+tasklist /FI "IMAGENAME eq OrbitDownloader.exe" /NH 2>nul | find /I "OrbitDownloader.exe" >nul
+if not errorlevel 1 (
+    echo  실행 중인 Orbit Downloader가 감지됐어요.
+    echo  업데이트하려면 종료해야 합니다. 자동으로 닫을게요...
+    taskkill /F /IM OrbitDownloader.exe /T >nul 2>&1
+    echo [INFO] taskkill OrbitDownloader.exe >> "%LOG%"
+    powershell -NoProfile -Command "Start-Sleep -Seconds 2"
+)
+
+REM Clean leftover partial files. If del still fails after taskkill, the file is
+REM locked by something else ? bail with a clear message.
+if exist "%EXE_PATH%" (
+    del /F /Q "%EXE_PATH%" 2>>"%LOG%"
+    if exist "%EXE_PATH%" goto :err_locked
+)
 if exist "%EXE_PATH%.new" del /F /Q "%EXE_PATH%.new" 2>nul
+if exist "%EXE_PATH%.old" del /F /Q "%EXE_PATH%.old" 2>nul
 
 echo [1/3] 최신 EXE 다운로드 (약 130MB)
 echo       - 사이즈가 크니 30초~수분 걸릴 수 있어요.
@@ -42,6 +57,7 @@ echo       - 에러가 나면 그대로 보여집니다.
 echo.
 
 REM ---------- METHOD 1: PowerShell Invoke-WebRequest (가장 안정적) ----------
+set "PSOUT=%TEMP%\orbit-ps-out.txt"
 echo --- attempt 1: PowerShell Invoke-WebRequest --- >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ProgressPreference='SilentlyContinue';" ^
@@ -50,8 +66,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  Write-Host ('OK ' + (Get-Item '%EXE_PATH%').Length + ' bytes')" ^
   "} catch {" ^
   "  Write-Host ('ERR ' + $_.Exception.Message); exit 1" ^
-  "}"
+  "}" > "%PSOUT%" 2>&1
 set "PSRC=%ERRORLEVEL%"
+type "%PSOUT%"
+type "%PSOUT%" >> "%LOG%"
 echo PowerShell exit=%PSRC% >> "%LOG%"
 
 if "%PSRC%"=="0" if exist "%EXE_PATH%" goto :verify_size
@@ -66,7 +84,20 @@ echo --- attempt 2: curl --- >> "%LOG%"
 curl -L --connect-timeout 15 -A "orbit-installer" -o "%EXE_PATH%" "%URL%"
 set "CRC=%ERRORLEVEL%"
 echo curl exit=%CRC% >> "%LOG%"
-if not "%CRC%"=="0" goto :err_download
+if "%CRC%"=="0" goto :curl_ok
+
+echo.
+echo  curl 종료 코드 %CRC% 의 뜻:
+if "%CRC%"=="6"  echo    6  = DNS 해석 실패. 인터넷 또는 DNS 설정 확인.
+if "%CRC%"=="7"  echo    7  = 연결 실패. 방화벽/프록시 차단 가능성.
+if "%CRC%"=="23" echo    23 = 파일 쓰기 실패. EXE가 다른 프로세스에 잠겨있어요.
+if "%CRC%"=="35" echo    35 = TLS 핸드셰이크 실패. 시스템 시간/인증서 확인.
+if "%CRC%"=="60" echo    60 = SSL 인증서 검증 실패. 시간/CA 확인.
+if "%CRC%"=="22" echo    22 = HTTP 4xx/5xx 응답. URL 또는 권한 확인.
+if "%CRC%"=="28" echo    28 = 타임아웃. 네트워크 느림 또는 차단.
+goto :err_download
+
+:curl_ok
 if not exist "%EXE_PATH%" goto :err_download
 
 :verify_size
@@ -119,6 +150,19 @@ echo [FATAL] mkdir failed >> "%LOG%"
 echo.
 echo [ERROR] 설치 폴더를 만들 수 없어요. 권한/디스크 공간 확인.
 echo         %INSTALL_DIR%
+goto :report
+
+:err_locked
+echo [FATAL] cannot delete existing %EXE_PATH% ? locked >> "%LOG%"
+echo.
+echo [ERROR] 기존 OrbitDownloader.exe 파일이 잠겨있어 덮어쓸 수 없어요.
+echo         원인:
+echo           - Orbit Downloader가 아직 실행 중 (자동 종료 시도했지만 실패)
+echo           - 백신/실시간 보호가 파일을 검사 중
+echo           - 다른 사용자 세션이 잡고 있음
+echo         조치:
+echo           1. 작업관리자 → 'OrbitDownloader.exe' 모두 종료
+echo           2. 잠시 기다린 뒤 install.bat 다시 실행
 goto :report
 
 :err_download
