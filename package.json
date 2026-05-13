@@ -1,7 +1,7 @@
 {
   "name": "orbit-downloader",
   "private": true,
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "Smart multi-platform video downloader (X / YouTube / TikTok / Instagram / ...)",
   "type": "module",
   "main": "electron/main.js",

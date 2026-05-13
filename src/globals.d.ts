@@ -77,10 +77,8 @@ declare global {
       cancelDownload: (id: string) => Promise<boolean>;
       onDownloadProgress: (cb: (data: { id: string; text: string }) => void) => void;
       onDownloadComplete: (cb: (data: { id: string; code: number; cancelled: boolean }) => void) => void;
-      onUpdateReady: (cb: (info: UpdateInfo) => void) => void;
       onUpdateStatus: (cb: (status: UpdateStatus) => void) => void;
       onUpdateApplied: (cb: (info: UpdateApplied) => void) => void;
-      restartForUpdate: () => void;
       checkUpdateNow: () => Promise<boolean>;
       getDebugInfo: () => Promise<DebugInfo>;
       openLogFolder: () => Promise<boolean>;

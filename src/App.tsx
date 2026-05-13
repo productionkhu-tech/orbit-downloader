@@ -19,12 +19,10 @@ import {
   Folder,
   Headphones,
   Captions,
-  Plus,
-  Minus,
   ArrowRight,
   Globe,
 } from 'lucide-react';
-import type { AppConfig, Quality, UpdateInfo, UpdateStatus, DebugInfo } from './globals';
+import type { AppConfig, Quality, UpdateStatus, DebugInfo } from './globals';
 
 // ============================================================
 // URL parsing
@@ -303,14 +301,13 @@ function App() {
     quality: 'best',
     audioOnly: false,
     subtitle: false,
-    maxConcurrent: 2,
+    maxConcurrent: 3,
   });
   const [inputText, setInputText] = useState('');
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [ytdlpStatus, setYtdlpStatus] = useState<{ installed: boolean; bundled: boolean; version: string } | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null);
-  const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ status: 'checking' });
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -352,7 +349,6 @@ function App() {
       );
     });
 
-    window.electronAPI.onUpdateReady((info) => setPendingUpdate(info));
     window.electronAPI.onUpdateStatus((status) => setUpdateStatus(status));
     window.electronAPI.onUpdateApplied(({ from, to }) => {
       showToast(`업데이트 완료 — v${from} → v${to}`, 'ok');
@@ -539,9 +535,11 @@ function App() {
           )}
           <UpdateBadge
             status={updateStatus}
-            pending={pendingUpdate}
-            onRestart={() => window.electronAPI?.restartForUpdate()}
             onCheckNow={() => window.electronAPI?.checkUpdateNow()}
+            onShowDebug={async () => {
+              const info = await window.electronAPI?.getDebugInfo();
+              if (info) setDebugInfo(info);
+            }}
           />
         </div>
       </header>
@@ -620,35 +618,6 @@ function App() {
           icon={<Captions size={12.5} />}
           label="자막 포함"
         />
-
-        <Separator />
-
-        {/* Concurrency */}
-        <div className="flex items-center gap-2.5 shrink-0">
-          <span className="text-[12px] text-[#5C5A52] font-medium">동시 다운로드</span>
-          <div className="flex items-center bg-white rounded-md border border-[#1F1E1B]/[0.08]">
-            <button
-              onClick={() => updateConfig('maxConcurrent', Math.max(1, config.maxConcurrent - 1))}
-              disabled={config.maxConcurrent <= 1}
-              className="w-6 h-7 grid place-items-center text-[#8B8579] hover:text-[#D97757] disabled:opacity-25 disabled:cursor-not-allowed transition-colors"
-              aria-label="줄이기"
-            >
-              <Minus size={11} />
-            </button>
-            <span className="w-7 text-center text-[12.5px] font-semibold tabular-nums text-[#1F1E1B] border-x border-[#1F1E1B]/[0.06] leading-7">
-              {config.maxConcurrent}
-            </span>
-            <button
-              onClick={() => updateConfig('maxConcurrent', Math.min(5, config.maxConcurrent + 1))}
-              disabled={config.maxConcurrent >= 5}
-              className="w-6 h-7 grid place-items-center text-[#8B8579] hover:text-[#D97757] disabled:opacity-25 disabled:cursor-not-allowed transition-colors"
-              aria-label="늘리기"
-            >
-              <Plus size={11} />
-            </button>
-          </div>
-          <span className="text-[11px] text-[#A8A29E]">개</span>
-        </div>
       </div>
 
       {/* ============ Main ============ */}
@@ -882,30 +851,12 @@ ${info.logTail || '(없음)'}
 }
 
 function UpdateBadge({
-  status, pending, onRestart, onCheckNow,
+  status, onCheckNow, onShowDebug,
 }: {
   status: UpdateStatus;
-  pending: UpdateInfo | null;
-  onRestart: () => void;
   onCheckNow: () => void;
+  onShowDebug: () => void;
 }) {
-  // Pending update wins over any transient status — always offer the restart action.
-  if (pending) {
-    return (
-      <button
-        onClick={onRestart}
-        title={`v${pending.version} 다운로드 완료 · 클릭하면 재시작하며 적용`}
-        className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#D97757] text-white text-[11px] font-semibold shadow-[0_1px_4px_rgba(217,119,87,0.4)] hover:bg-[#C9633E] transition-colors active:scale-95"
-      >
-        <span className="relative flex h-1.5 w-1.5">
-          <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-75 animate-ping" />
-          <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white" />
-        </span>
-        업데이트 준비됨 · 재시작
-      </button>
-    );
-  }
-
   const baseClass =
     'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors';
 
@@ -924,8 +875,8 @@ function UpdateBadge({
     case 'downloading':
       return (
         <button
-          onClick={onCheckNow}
-          title={`v${status.version} 다운로드 중 (${status.percent}%)`}
+          onClick={onShowDebug}
+          title={`v${status.version} 다운로드 중 (${status.percent}%) · 클릭하면 진단 정보`}
           className={`${baseClass} bg-[#FBEDE5] text-[#C9633E]`}
         >
           <Loader2 size={11} className="animate-spin" />
@@ -946,8 +897,8 @@ function UpdateBadge({
     case 'error':
       return (
         <button
-          onClick={onCheckNow}
-          title={`업데이트 확인 실패: ${status.message} · 클릭하면 다시 시도`}
+          onClick={onShowDebug}
+          title={`업데이트 확인 실패: ${status.message} · 클릭하면 진단 정보`}
           className={`${baseClass} bg-amber-50 text-amber-700 hover:bg-amber-100`}
         >
           <AlertCircle size={11} />
@@ -955,17 +906,19 @@ function UpdateBadge({
         </button>
       );
     case 'ready':
-      // 'ready' without pendingUpdate happens if the renderer reconnects later; same UI as pending.
+      // Informational only — no manual restart. The app will swap-and-relaunch
+      // on next close (before-quit handler).
       return (
         <button
-          onClick={onRestart}
+          onClick={onShowDebug}
+          title={`v${status.version} 다운로드 완료 · 앱을 끄면 자동 적용 후 다시 켜집니다`}
           className={`${baseClass} bg-[#D97757] text-white shadow-[0_1px_4px_rgba(217,119,87,0.4)] hover:bg-[#C9633E] font-semibold`}
         >
           <span className="relative flex h-1.5 w-1.5">
             <span className="absolute inline-flex h-full w-full rounded-full bg-white opacity-75 animate-ping" />
             <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white" />
           </span>
-          v{status.version} 준비됨 · 재시작
+          v{status.version} 준비됨 · 끄면 자동 적용
         </button>
       );
   }

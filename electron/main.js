@@ -167,7 +167,7 @@ async function checkForUpdate() {
       if (Notification.isSupported()) {
         const n = new Notification({
           title: 'Orbit Downloader',
-          body: `v${latest} 업데이트가 준비됐어요. 앱을 끄거나 재시작하면 적용됩니다.`,
+          body: `v${latest} 새 버전이 다운로드됐어요. 앱을 끄면 자동으로 적용 후 다시 켜집니다.`,
           silent: false,
         });
         n.on('click', () => {
@@ -178,12 +178,6 @@ async function checkForUpdate() {
         n.show();
       }
     } catch (e) { ulog.warn(`notification failed: ${e.message}`); }
-
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-ready', {
-        version: latest, notes: release.body || '', ready: true,
-      });
-    }
   } catch (e) {
     lastUpdateError = e.message;
     ulog.error(`download failed: ${e.message}`);
@@ -199,18 +193,26 @@ function startUpdateScheduler() {
 }
 
 // Spawn a detached helper batch that, after this process exits, replaces the
-// portable exe with the staged .new file. We use the rename-first trick:
-// even when the portable launcher still holds a handle on the exe, NTFS
-// allows renaming an open file. `move /Y` would fail.
+// portable exe with the staged .new file.
 //
-// The helper writes every step to swap.log next to the exe so failures are
-// diagnosable.
+// The portable launcher keeps the .exe file locked for some time after the
+// inner app quits (it has to clean up its temp extraction first). So instead
+// of a fixed wait, we POLL: try to rename every 2 seconds, up to 60 seconds.
+// Once rename succeeds the launcher has definitely released the handle.
+//
+// All steps are logged to swap.log next to the exe so failures are diagnosable.
+// The swap helper itself is also written next to the exe (not %TEMP%) so it
+// isn't touched by aggressive temp-cleaners or quarantined by AV.
 function applyPendingUpdateOnExit({ relaunch }) {
   if (!pendingUpdate) return;
   const target = installedExePath();
   const src = pendingUpdate.newExePath;
   if (!fs.existsSync(src)) {
     ulog.error(`swap aborted — staged file missing: ${src}`);
+    return;
+  }
+  if (!process.env.PORTABLE_EXECUTABLE_FILE) {
+    ulog.error(`swap aborted — PORTABLE_EXECUTABLE_FILE not set, target=${target} looks like a temp extraction and won't survive`);
     return;
   }
 
@@ -220,44 +222,72 @@ function applyPendingUpdateOnExit({ relaunch }) {
   } catch (_) {}
 
   const dir = path.dirname(target);
-  const oldPath = `${target}.old`;
+  const targetBase = path.basename(target);
+  const oldBase = `${targetBase}.old`;
+  const oldPath = path.join(dir, oldBase);
   const swapLog = path.join(dir, 'swap.log');
-  const swapBat = path.join(os.tmpdir(), `orbit-swap-${Date.now()}.bat`);
+  const swapBat = path.join(dir, 'orbit-swap.bat');
 
+  // Use GOTO-based flow control instead of nested ifs — cmd's nested-if
+  // parsing inside parentheses is notoriously buggy.
   const lines = [
     '@echo off',
-    `echo [%date% %time%] swap starting > "${swapLog}"`,
-    `echo target = ${target} >> "${swapLog}"`,
-    `echo src    = ${src} >> "${swapLog}"`,
+    'setlocal',
+    `set "TARGET=${target}"`,
+    `set "SRC=${src}"`,
+    `set "OLD=${oldPath}"`,
+    `set "OLD_BASE=${oldBase}"`,
+    `set "TARGET_BASE=${targetBase}"`,
+    `set "LOG=${swapLog}"`,
+    '',
+    'echo. >> "%LOG%"',
+    'echo ============================================================ >> "%LOG%"',
+    'echo [%date% %time%] swap.bat START >> "%LOG%"',
+    'echo target = %TARGET% >> "%LOG%"',
+    'echo src    = %SRC% >> "%LOG%"',
+    '',
+    'REM Clean up any leftover .old from a previous successful swap.',
+    'if exist "%OLD%" (',
+    '  del /F /Q "%OLD%" >nul 2>&1',
+    '  echo [%date% %time%] removed leftover .old >> "%LOG%"',
+    ')',
+    '',
+    'REM Poll for file unlock — try to rename every 2 seconds, up to ~60 seconds.',
+    'set /A ATTEMPTS=0',
+    ':try_rename',
+    'set /A ATTEMPTS+=1',
+    'ren "%TARGET%" "%OLD_BASE%" >nul 2>&1',
+    'if not errorlevel 1 goto :renamed',
+    'if %ATTEMPTS% GEQ 30 goto :rename_failed',
     'ping 127.0.0.1 -n 3 >nul',
-    // Clean up any leftover .old from a previous successful swap.
-    `if exist "${oldPath}" del /F /Q "${oldPath}"`,
-    // Rename current exe out of the way (works even when launcher holds it).
-    `ren "${target}" "${path.basename(oldPath)}"`,
-    'if errorlevel 1 (',
-    `  echo [ERROR] rename failed >> "${swapLog}"`,
-    // Last-resort: try direct overwrite. Probably also fails but log it.
-    `  move /Y "${src}" "${target}" >> "${swapLog}" 2>&1`,
-    `  if errorlevel 1 echo [FATAL] move also failed, no swap performed >> "${swapLog}"`,
-    `  goto :relaunch`,
-    ')',
-    // Move new file into place.
-    `move /Y "${src}" "${target}" >> "${swapLog}" 2>&1`,
-    'if errorlevel 1 (',
-    `  echo [ERROR] move new file failed, rolling back >> "${swapLog}"`,
-    // Roll back the rename so we don't leave a broken install.
-    `  ren "${oldPath}" "${path.basename(target)}"`,
-    `  goto :relaunch`,
-    ')',
-    `echo [OK] swap complete >> "${swapLog}"`,
+    'goto :try_rename',
+    '',
+    ':rename_failed',
+    'echo [%date% %time%] FATAL rename failed after %ATTEMPTS% attempts >> "%LOG%"',
+    'goto :end',
+    '',
+    ':renamed',
+    'echo [%date% %time%] rename ok on attempt %ATTEMPTS% >> "%LOG%"',
+    'move /Y "%SRC%" "%TARGET%" >> "%LOG%" 2>&1',
+    'if errorlevel 1 goto :move_failed',
+    'echo [%date% %time%] swap complete >> "%LOG%"',
+    'goto :relaunch',
+    '',
+    ':move_failed',
+    'echo [%date% %time%] FATAL move failed, rolling back >> "%LOG%"',
+    'ren "%OLD%" "%TARGET_BASE%" >nul 2>&1',
+    'goto :end',
+    '',
     ':relaunch',
   ];
   if (relaunch) {
-    lines.push('ping 127.0.0.1 -n 3 >nul');
-    lines.push(`start "" "${target}"`);
-    lines.push(`echo [%date% %time%] relaunched >> "${swapLog}"`);
+    lines.push('ping 127.0.0.1 -n 2 >nul');
+    lines.push('start "" "%TARGET%"');
+    lines.push('echo [%date% %time%] relaunched >> "%LOG%"');
   }
-  lines.push(`del /F /Q "${swapBat.replace(/\//g, '\\')}"`);
+  lines.push('');
+  lines.push(':end');
+  lines.push('endlocal');
 
   try {
     fs.writeFileSync(swapBat, lines.join('\r\n'), 'utf8');
@@ -307,12 +337,9 @@ function consumePendingAppliedToast() {
   return null;
 }
 
-ipcMain.handle('restart-for-update', () => {
-  if (!pendingUpdate) return false;
-  applyPendingUpdateOnExit({ relaunch: true });
-  setTimeout(() => app.quit(), 200);
-  return true;
-});
+// Restart-for-update IPC is intentionally removed in v1.5.5.
+// User intent: "버튼 누르지 말고 알아서 끄고 켜라" — updates apply only on
+// the natural before-quit, then auto-relaunch.
 
 ipcMain.handle('check-update-now', async () => {
   await checkForUpdate();
