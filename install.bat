@@ -1,15 +1,15 @@
 @echo off
 title Orbit Downloader Installer
 
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "REPO=productionkhu-tech/orbit-downloader"
 set "INSTALL_DIR=%LOCALAPPDATA%\Orbit Downloader"
 set "EXE_PATH=%INSTALL_DIR%\OrbitDownloader.exe"
 set "URL=https://github.com/%REPO%/releases/latest/download/OrbitDownloader.exe"
 set "LOG=%TEMP%\orbit-install.log"
+set "MIN_SIZE=52428800"
 
-REM Reset log
 echo ============================================================ > "%LOG%"
 echo  Orbit Downloader 설치 로그 - %date% %time% >> "%LOG%"
 echo ============================================================ >> "%LOG%"
@@ -28,43 +28,64 @@ echo  로그 파일: %LOG%
 echo.
 
 if not exist "%INSTALL_DIR%" (
-    echo [INFO] mkdir %INSTALL_DIR% >> "%LOG%"
     mkdir "%INSTALL_DIR%" 2>>"%LOG%"
     if errorlevel 1 goto :err_mkdir
 )
 
-echo [1/3] 최신 EXE 다운로드 (약 130MB)...
+REM Clean any leftover partial file from a previous attempt.
+if exist "%EXE_PATH%" del /F /Q "%EXE_PATH%" 2>nul
+if exist "%EXE_PATH%.new" del /F /Q "%EXE_PATH%.new" 2>nul
+
+echo [1/3] 최신 EXE 다운로드 (약 130MB)
+echo       - 사이즈가 크니 30초~수분 걸릴 수 있어요.
+echo       - 에러가 나면 그대로 보여집니다.
 echo.
 
+REM ---------- METHOD 1: PowerShell Invoke-WebRequest (가장 안정적) ----------
+echo --- attempt 1: PowerShell Invoke-WebRequest --- >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ProgressPreference='SilentlyContinue';" ^
+  "try {" ^
+  "  Invoke-WebRequest -Uri '%URL%' -OutFile '%EXE_PATH%' -UseBasicParsing -MaximumRedirection 10 -ErrorAction Stop;" ^
+  "  Write-Host ('OK ' + (Get-Item '%EXE_PATH%').Length + ' bytes')" ^
+  "} catch {" ^
+  "  Write-Host ('ERR ' + $_.Exception.Message); exit 1" ^
+  "}"
+set "PSRC=%ERRORLEVEL%"
+echo PowerShell exit=%PSRC% >> "%LOG%"
+
+if "%PSRC%"=="0" if exist "%EXE_PATH%" goto :verify_size
+
+REM ---------- METHOD 2: curl --------
 where curl >nul 2>&1
-if errorlevel 1 goto :use_powershell
-
-echo [INFO] curl >> "%LOG%"
-curl -L --fail -o "%EXE_PATH%" "%URL%" 2>>"%LOG%"
-if errorlevel 1 goto :err_download
-goto :downloaded
-
-:use_powershell
-echo  curl이 없어 PowerShell로 다운로드합니다...
-echo [INFO] powershell >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; try { Invoke-WebRequest -Uri '%URL%' -OutFile '%EXE_PATH%' -UseBasicParsing -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 1 }" 2>>"%LOG%"
 if errorlevel 1 goto :err_download
 
-:downloaded
+echo.
+echo  PowerShell 실패, curl로 재시도...
+echo --- attempt 2: curl --- >> "%LOG%"
+curl -L --connect-timeout 15 -A "orbit-installer" -o "%EXE_PATH%" "%URL%"
+set "CRC=%ERRORLEVEL%"
+echo curl exit=%CRC% >> "%LOG%"
+if not "%CRC%"=="0" goto :err_download
 if not exist "%EXE_PATH%" goto :err_download
 
-REM Sanity check: file should be at least 50 MB. Smaller usually means an HTML error page was saved.
+:verify_size
 for %%A in ("%EXE_PATH%") do set "EXE_SIZE=%%~zA"
 echo [INFO] downloaded bytes=%EXE_SIZE% >> "%LOG%"
-if %EXE_SIZE% LSS 52428800 goto :err_too_small
+if %EXE_SIZE% LSS %MIN_SIZE% goto :err_too_small
 
+echo  다운로드 OK (%EXE_SIZE% bytes)
 echo.
 echo [2/3] 바탕화면 단축 아이콘 생성...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Orbit Downloader.lnk'); $s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()" 2>>"%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Orbit Downloader.lnk');" ^
+  "$s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()" 2>>"%LOG%"
 if errorlevel 1 echo   (바탕화면 단축아이콘은 생략됨)
 
 echo [3/3] 시작메뉴 등록...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:APPDATA+'\Microsoft\Windows\Start Menu\Programs\Orbit Downloader.lnk'); $s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()" 2>>"%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:APPDATA+'\Microsoft\Windows\Start Menu\Programs\Orbit Downloader.lnk');" ^
+  "$s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()" 2>>"%LOG%"
 if errorlevel 1 echo   (시작메뉴 등록은 생략됨)
 
 echo [OK] install complete >> "%LOG%"
@@ -96,37 +117,41 @@ REM ============================================================
 :err_mkdir
 echo [FATAL] mkdir failed >> "%LOG%"
 echo.
-echo [ERROR] 설치 폴더를 만들 수 없습니다.
+echo [ERROR] 설치 폴더를 만들 수 없어요. 권한/디스크 공간 확인.
 echo         %INSTALL_DIR%
-echo         권한 또는 디스크 공간을 확인해 주세요.
 goto :report
 
 :err_download
-echo [FATAL] download failed >> "%LOG%"
+echo [FATAL] all download attempts failed >> "%LOG%"
 echo.
 echo [ERROR] EXE 다운로드 실패.
-echo         URL: %URL%
-echo         인터넷 연결 또는 GitHub 접근 가능 여부를 확인해 주세요.
+echo.
+echo  체크리스트:
+echo    1. 인터넷 연결되어 있나요? (브라우저에서 github.com 열어보기)
+echo    2. 백신/방화벽이 curl·powershell의 다운로드를 막고 있나요?
+echo    3. 회사·학교 네트워크라면 프록시 설정이 필요할 수 있어요.
+echo.
+echo  수동 다운로드:
+echo    %URL%
+echo    → 받은 OrbitDownloader.exe 를 %INSTALL_DIR%\ 에 직접 넣으세요.
 goto :report
 
 :err_too_small
-echo [FATAL] downloaded file is suspiciously small: %EXE_SIZE% bytes >> "%LOG%"
+echo [FATAL] downloaded file is %EXE_SIZE% bytes (expected ^>= %MIN_SIZE%) >> "%LOG%"
 echo.
-echo [ERROR] 다운로드된 파일이 너무 작습니다 (%EXE_SIZE% bytes).
-echo         네트워크가 HTML 에러 페이지를 반환했을 가능성이 있어요.
+echo [ERROR] 받아진 파일이 너무 작아요 (%EXE_SIZE% bytes).
+echo         네트워크가 HTML 에러 페이지로 응답했거나 중간에 끊긴 거예요.
 goto :report
 
 :report
 echo.
-echo  ─────────────────────────────────────────────
-echo  자세한 로그가 아래 경로에 저장되었습니다:
-echo  %LOG%
-echo  ─────────────────────────────────────────────
+echo --- 로그 마지막 20줄 ---
+powershell -NoProfile -Command "Get-Content -Path '%LOG%' -Tail 20 -Encoding UTF8"
+echo --- 로그 전체: %LOG%
 echo.
-choice /C YN /N /M "로그 파일을 열어보시겠습니까 (Y/N)? "
-if errorlevel 2 goto :err_end
-start "" notepad "%LOG%"
-:err_end
+echo  로그 전체를 보고 싶으면 메모장이 열립니다.
+choice /C YN /N /T 8 /D Y /M "로그를 메모장으로 열까요 (Y/N, 8초 후 Y)? "
+if not errorlevel 2 start "" notepad "%LOG%"
 echo.
 pause
 endlocal
