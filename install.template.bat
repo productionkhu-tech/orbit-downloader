@@ -10,23 +10,23 @@ set "URL=https://github.com/%REPO%/releases/latest/download/OrbitDownloader.exe"
 
 echo.
 echo ============================================
-echo    Orbit Downloader ¼³Ä¡
+echo    Orbit Downloader ì„¤ì¹˜
 echo ============================================
 echo.
-echo  ¼³Ä¡ À§Ä¡: %INSTALL_DIR%
+echo  ì„¤ì¹˜ ìœ„ì¹˜: %INSTALL_DIR%
 echo.
 
 if not exist "%INSTALL_DIR%" (
     mkdir "%INSTALL_DIR%" 2>nul
     if errorlevel 1 (
-        echo [ERROR] ¼³Ä¡ Æú´õ »ý¼º ½ÇÆÐ. ±ÇÇÑÀ» È®ÀÎÇÏ¼¼¿ä.
+        echo [ERROR] ì„¤ì¹˜ í´ë” ìƒì„± ì‹¤íŒ¨. ê¶Œí•œì„ í™•ì¸í•˜ì„¸ìš”.
         echo.
         pause
         exit /b 1
     )
 )
 
-echo [1/3] ÃÖ½Å EXE ´Ù¿î·Îµå ^(¾à 130MB^)...
+echo [1/3] ìµœì‹  EXE ë‹¤ìš´ë¡œë“œ ^(ì•½ 130MB^)...
 echo.
 
 where curl >nul 2>&1
@@ -35,7 +35,7 @@ if errorlevel 1 goto :use_powershell
 curl -L --fail -o "%EXE_PATH%" "%URL%"
 if errorlevel 1 (
     echo.
-    echo [ERROR] curl ´Ù¿î·Îµå ½ÇÆÐ.
+    echo [ERROR] curl ë‹¤ìš´ë¡œë“œ ì‹¤íŒ¨.
     echo URL: %URL%
     echo.
     pause
@@ -44,11 +44,11 @@ if errorlevel 1 (
 goto :downloaded
 
 :use_powershell
-echo  curlÀÌ ¾ø¾î PowerShell·Î ´Ù¿î·ÎµåÇÕ´Ï´Ù...
+echo  curlì´ ì—†ì–´ PowerShellë¡œ ë‹¤ìš´ë¡œë“œí•©ë‹ˆë‹¤...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='Continue'; try { Invoke-WebRequest -Uri '%URL%' -OutFile '%EXE_PATH%' -UseBasicParsing -ErrorAction Stop } catch { Write-Host $_.Exception.Message; exit 1 }"
 if errorlevel 1 (
     echo.
-    echo [ERROR] PowerShell ´Ù¿î·Îµå ½ÇÆÐ.
+    echo [ERROR] PowerShell ë‹¤ìš´ë¡œë“œ ì‹¤íŒ¨.
     echo URL: %URL%
     echo.
     pause
@@ -58,7 +58,7 @@ if errorlevel 1 (
 :downloaded
 if not exist "%EXE_PATH%" (
     echo.
-    echo [ERROR] ´Ù¿î·Îµå Á÷ÈÄ ÆÄÀÏÀ» Ã£À» ¼ö ¾ø½À´Ï´Ù.
+    echo [ERROR] ë‹¤ìš´ë¡œë“œ ì§í›„ íŒŒì¼ì„ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤.
     echo Expected: %EXE_PATH%
     echo.
     pause
@@ -66,31 +66,31 @@ if not exist "%EXE_PATH%" (
 )
 
 echo.
-echo [2/3] ¹ÙÅÁÈ­¸é ´ÜÃà ¾ÆÀÌÄÜ »ý¼º...
+echo [2/3] ë°”íƒ•í™”ë©´ ë‹¨ì¶• ì•„ì´ì½˜ ìƒì„±...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Orbit Downloader.lnk'); $s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()"
-if errorlevel 1 echo   ^(¹ÙÅÁÈ­¸é ´ÜÃà¾ÆÀÌÄÜÀº »ý·«µÊ^)
+if errorlevel 1 echo   ^(ë°”íƒ•í™”ë©´ ë‹¨ì¶•ì•„ì´ì½˜ì€ ìƒëžµë¨^)
 
-echo [3/3] ½ÃÀÛ¸Þ´º µî·Ï...
+echo [3/3] ì‹œìž‘ë©”ë‰´ ë“±ë¡...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:APPDATA+'\Microsoft\Windows\Start Menu\Programs\Orbit Downloader.lnk'); $s.TargetPath='%EXE_PATH%'; $s.IconLocation='%EXE_PATH%'; $s.WorkingDirectory='%INSTALL_DIR%'; $s.Save()"
-if errorlevel 1 echo   ^(½ÃÀÛ¸Þ´º µî·ÏÀº »ý·«µÊ^)
+if errorlevel 1 echo   ^(ì‹œìž‘ë©”ë‰´ ë“±ë¡ì€ ìƒëžµë¨^)
 
 echo.
 echo ============================================
-echo    ¼³Ä¡ ¿Ï·á!
+echo    ì„¤ì¹˜ ì™„ë£Œ!
 echo ============================================
 echo.
-echo  ¹ÙÅÁÈ­¸éÀÇ 'Orbit Downloader' ¾ÆÀÌÄÜÀ» ´õºíÅ¬¸¯ÇÏ¼¼¿ä.
-echo  ¾÷µ¥ÀÌÆ®´Â ¾ÛÀÌ ÄÑÁú ¶§ ÀÚµ¿À¸·Î È®ÀÎµË´Ï´Ù.
+echo  ë°”íƒ•í™”ë©´ì˜ 'Orbit Downloader' ì•„ì´ì½˜ì„ ë”ë¸”í´ë¦­í•˜ì„¸ìš”.
+echo  ì—…ë°ì´íŠ¸ëŠ” ì•±ì´ ì¼œì§ˆ ë•Œ ìžë™ìœ¼ë¡œ í™•ì¸ë©ë‹ˆë‹¤.
 echo.
 
-choice /C YN /N /T 10 /D Y /M "Áö±Ý ½ÇÇàÇÏ½Ã°Ú½À´Ï±î (Y/N, 10ÃÊ ÈÄ ÀÚµ¿ ½ÇÇà)? "
+choice /C YN /N /T 10 /D Y /M "ì§€ê¸ˆ ì‹¤í–‰í•˜ì‹œê² ìŠµë‹ˆê¹Œ (Y/N, 10ì´ˆ í›„ ìžë™ ì‹¤í–‰)? "
 if errorlevel 2 goto :end
 
 start "" "%EXE_PATH%"
 
 :end
 echo.
-echo  ¿Ï·á. ¾Æ¹« Å°³ª ´©¸£¸é Ã¢ÀÌ ´ÝÈü´Ï´Ù.
+echo  ì™„ë£Œ. ì•„ë¬´ í‚¤ë‚˜ ëˆ„ë¥´ë©´ ì°½ì´ ë‹«íž™ë‹ˆë‹¤.
 pause >nul
 endlocal
 exit /b 0

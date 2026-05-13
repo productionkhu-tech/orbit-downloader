@@ -8,6 +8,7 @@
   "scripts": {
     "fetch-bins": "node scripts/fetch-binaries.mjs",
     "build:icon": "node scripts/build-icon.mjs",
+    "build:installer": "node scripts/build-installer.mjs",
     "dev": "concurrently -k \"vite\" \"cross-env NODE_ENV=development electron .\"",
     "build:react": "tsc -b && vite build",
     "build": "npm run build:icon && npm run fetch-bins && npm run build:react && electron-builder",
