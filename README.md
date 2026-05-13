@@ -6,7 +6,7 @@
 
 ## 설치 (사용자용)
 
-**[install.bat 다운로드](https://raw.githubusercontent.com/productionkhu-tech/orbit-downloader/main/install.bat)** → 더블클릭하면 자동으로:
+**[install.bat 다운로드](https://github.com/productionkhu-tech/orbit-downloader/releases/latest/download/install.bat)** → 더블클릭하면 자동으로:
 - `%LOCALAPPDATA%\Orbit Downloader` 폴더에 최신 EXE 설치
 - 바탕화면 + 시작메뉴 단축 아이콘 생성
 
