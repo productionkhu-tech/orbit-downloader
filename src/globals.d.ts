@@ -45,6 +45,20 @@ export interface UpdateApplied {
   to: string;
 }
 
+export interface DebugInfo {
+  version: string;
+  portable: boolean;
+  portableExe: string;
+  runningExe: string;
+  installedExe: string;
+  logPath: string;
+  lastError: string;
+  logTail: string;
+  platform: string;
+  electron: string;
+  node: string;
+}
+
 declare global {
   const __APP_VERSION__: string;
   const __BUILD_DATE__: string;
@@ -68,6 +82,8 @@ declare global {
       onUpdateApplied: (cb: (info: UpdateApplied) => void) => void;
       restartForUpdate: () => void;
       checkUpdateNow: () => Promise<boolean>;
+      getDebugInfo: () => Promise<DebugInfo>;
+      openLogFolder: () => Promise<boolean>;
     };
   }
 }

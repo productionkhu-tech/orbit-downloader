@@ -20,6 +20,30 @@ const activeDownloads = new Map();
 const UPDATE_REPO = 'productionkhu-tech/orbit-downloader';
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
+// Log file lives next to the installed EXE when possible, otherwise userData.
+function updateLogPath() {
+  try {
+    const exe = process.env.PORTABLE_EXECUTABLE_FILE;
+    if (exe) return path.join(path.dirname(exe), 'update.log');
+  } catch (_) {}
+  return path.join(app.getPath('userData'), 'update.log');
+}
+
+function appendUpdateLog(level, msg) {
+  try {
+    const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
+    fs.appendFileSync(updateLogPath(), line, 'utf8');
+  } catch (_) {}
+}
+
+const ulog = {
+  info: (m) => { console.log('[update]', m); appendUpdateLog('INFO', m); },
+  warn: (m) => { console.warn('[update]', m); appendUpdateLog('WARN', m); },
+  error: (m) => { console.error('[update]', m); appendUpdateLog('ERROR', m); },
+};
+
+let lastUpdateError = ''; // surfaced in About dialog
+
 // Path of the actual on-disk EXE the user double-clicked. For an
 // electron-builder "portable" target the running process lives in a temp
 // extract — but PORTABLE_EXECUTABLE_FILE points to the original .exe, which
@@ -87,14 +111,18 @@ async function checkForUpdate() {
     sendUpdateStatus('ready', { version: pendingUpdate.version });
     return;
   }
+  ulog.info(`check start  current=${app.getVersion()}  exe=${installedExePath()}`);
   sendUpdateStatus('checking');
   const release = await fetchLatestRelease();
   if (!release || !release.tag_name) {
-    sendUpdateStatus('error', { message: 'GitHub Releases API에 도달하지 못했어요.' });
+    const m = 'GitHub Releases API에 도달하지 못했어요. (네트워크/방화벽 확인)';
+    lastUpdateError = m; ulog.error(m);
+    sendUpdateStatus('error', { message: m });
     return;
   }
   const latest = release.tag_name.replace(/^v/, '');
   const current = app.getVersion();
+  ulog.info(`server tag=${latest}  current=${current}`);
   if (compareSemver(latest, current) <= 0) {
     sendUpdateStatus('current', { version: current });
     return;
@@ -102,12 +130,18 @@ async function checkForUpdate() {
 
   const asset = (release.assets || []).find((a) => /^OrbitDownloader\.exe$/i.test(a.name));
   if (!asset) {
-    sendUpdateStatus('error', { message: `릴리즈 v${latest}에 OrbitDownloader.exe 자산이 없습니다.` });
+    const m = `릴리즈 v${latest}에 OrbitDownloader.exe 자산이 없습니다.`;
+    lastUpdateError = m; ulog.error(m);
+    sendUpdateStatus('error', { message: m });
     return;
   }
 
   const targetExe = installedExePath();
+  if (!process.env.PORTABLE_EXECUTABLE_FILE) {
+    ulog.warn(`PORTABLE_EXECUTABLE_FILE not set — falling back to ${targetExe}.  Update may not persist if this points to a temp directory.`);
+  }
   const newPath = `${targetExe}.new`;
+  ulog.info(`download start  asset=${asset.browser_download_url}  size=${asset.size}  → ${newPath}`);
   sendUpdateStatus('downloading', { version: latest, received: 0, total: asset.size || 0, percent: 0 });
   try {
     if (fs.existsSync(newPath)) fs.unlinkSync(newPath);
@@ -120,10 +154,15 @@ async function checkForUpdate() {
         sendUpdateStatus('downloading', { version: latest, received, total, percent });
       }
     });
+    const newSize = fs.statSync(newPath).size;
+    ulog.info(`download done  bytes=${newSize}`);
+    if (newSize < 50 * 1024 * 1024) {
+      throw new Error(`다운로드된 파일이 비정상적으로 작아요 (${newSize} bytes). HTML 에러 페이지일 수 있어요.`);
+    }
     pendingUpdate = { version: latest, notes: release.body || '', newExePath: newPath };
     sendUpdateStatus('ready', { version: latest });
+    ulog.info(`ready  v${latest} staged at ${newPath}`);
 
-    // System-level notification — visible even when the window is minimized.
     try {
       if (Notification.isSupported()) {
         const n = new Notification({
@@ -138,17 +177,17 @@ async function checkForUpdate() {
         });
         n.show();
       }
-    } catch (e) { console.error('[update] notification failed:', e.message); }
+    } catch (e) { ulog.warn(`notification failed: ${e.message}`); }
 
-    // Keep the legacy event for back-compat with v1.5.x renderers.
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-ready', {
         version: latest, notes: release.body || '', ready: true,
       });
     }
   } catch (e) {
+    lastUpdateError = e.message;
+    ulog.error(`download failed: ${e.message}`);
     sendUpdateStatus('error', { message: `다운로드 실패: ${e.message}` });
-    console.error('[update] download failed:', e.message);
   }
 }
 
@@ -159,43 +198,91 @@ function startUpdateScheduler() {
   setInterval(checkForUpdate, UPDATE_CHECK_INTERVAL_MS);
 }
 
-// Spawn a detached cmd that, after this process exits:
-//   1) waits a moment for the file lock to release
-//   2) replaces OrbitDownloader.exe with OrbitDownloader.exe.new
-//   3) optionally relaunches the freshly-swapped exe
-// Called on `before-quit` so the user's normal close still applies the update.
+// Spawn a detached helper batch that, after this process exits, replaces the
+// portable exe with the staged .new file. We use the rename-first trick:
+// even when the portable launcher still holds a handle on the exe, NTFS
+// allows renaming an open file. `move /Y` would fail.
+//
+// The helper writes every step to swap.log next to the exe so failures are
+// diagnosable.
 function applyPendingUpdateOnExit({ relaunch }) {
   if (!pendingUpdate) return;
   const target = installedExePath();
   const src = pendingUpdate.newExePath;
-  if (!fs.existsSync(src)) return;
+  if (!fs.existsSync(src)) {
+    ulog.error(`swap aborted — staged file missing: ${src}`);
+    return;
+  }
 
-  // Remember which version we just installed so the next launch can show a
-  // friendly "updated from X to Y" toast.
   try {
     store.set('pendingAppliedFrom', app.getVersion());
     store.set('pendingAppliedTo', pendingUpdate.version);
   } catch (_) {}
 
-  const parts = [
-    'ping 127.0.0.1 -n 2 >nul',
-    `move /Y "${src}" "${target}"`,
+  const dir = path.dirname(target);
+  const oldPath = `${target}.old`;
+  const swapLog = path.join(dir, 'swap.log');
+  const swapBat = path.join(os.tmpdir(), `orbit-swap-${Date.now()}.bat`);
+
+  const lines = [
+    '@echo off',
+    `echo [%date% %time%] swap starting > "${swapLog}"`,
+    `echo target = ${target} >> "${swapLog}"`,
+    `echo src    = ${src} >> "${swapLog}"`,
+    'ping 127.0.0.1 -n 3 >nul',
+    // Clean up any leftover .old from a previous successful swap.
+    `if exist "${oldPath}" del /F /Q "${oldPath}"`,
+    // Rename current exe out of the way (works even when launcher holds it).
+    `ren "${target}" "${path.basename(oldPath)}"`,
+    'if errorlevel 1 (',
+    `  echo [ERROR] rename failed >> "${swapLog}"`,
+    // Last-resort: try direct overwrite. Probably also fails but log it.
+    `  move /Y "${src}" "${target}" >> "${swapLog}" 2>&1`,
+    `  if errorlevel 1 echo [FATAL] move also failed, no swap performed >> "${swapLog}"`,
+    `  goto :relaunch`,
+    ')',
+    // Move new file into place.
+    `move /Y "${src}" "${target}" >> "${swapLog}" 2>&1`,
+    'if errorlevel 1 (',
+    `  echo [ERROR] move new file failed, rolling back >> "${swapLog}"`,
+    // Roll back the rename so we don't leave a broken install.
+    `  ren "${oldPath}" "${path.basename(target)}"`,
+    `  goto :relaunch`,
+    ')',
+    `echo [OK] swap complete >> "${swapLog}"`,
+    ':relaunch',
   ];
   if (relaunch) {
-    // Brief extra wait so the freshly written exe is fully flushed to disk.
-    parts.push('ping 127.0.0.1 -n 2 >nul');
-    parts.push(`start "" "${target}"`);
+    lines.push('ping 127.0.0.1 -n 3 >nul');
+    lines.push(`start "" "${target}"`);
+    lines.push(`echo [%date% %time%] relaunched >> "${swapLog}"`);
   }
-  const cmd = parts.join(' & ');
+  lines.push(`del /F /Q "${swapBat.replace(/\//g, '\\')}"`);
 
   try {
-    spawn('cmd', ['/c', cmd], {
+    fs.writeFileSync(swapBat, lines.join('\r\n'), 'utf8');
+    ulog.info(`spawning swap helper: ${swapBat}  relaunch=${relaunch}  swap.log=${swapLog}`);
+    spawn('cmd', ['/c', swapBat], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
     }).unref();
   } catch (e) {
-    console.error('[update] swap spawn failed:', e.message);
+    ulog.error(`swap spawn failed: ${e.message}`);
+  }
+}
+
+// On startup, clean up `.old` from a previous successful swap.
+function cleanupAfterSwap() {
+  try {
+    const exe = installedExePath();
+    const oldPath = `${exe}.old`;
+    if (fs.existsSync(oldPath)) {
+      fs.unlinkSync(oldPath);
+      ulog.info(`cleaned up leftover ${oldPath}`);
+    }
+  } catch (e) {
+    ulog.warn(`leftover .old cleanup failed: ${e.message}`);
   }
 }
 
@@ -229,6 +316,38 @@ ipcMain.handle('restart-for-update', () => {
 
 ipcMain.handle('check-update-now', async () => {
   await checkForUpdate();
+  return true;
+});
+
+ipcMain.handle('get-debug-info', () => {
+  let logTail = '';
+  try {
+    const p = updateLogPath();
+    if (fs.existsSync(p)) {
+      const content = fs.readFileSync(p, 'utf8');
+      const lines = content.trim().split('\n');
+      logTail = lines.slice(-25).join('\n');
+    }
+  } catch (e) { logTail = `(로그 읽기 실패: ${e.message})`; }
+  return {
+    version: app.getVersion(),
+    portable: !!process.env.PORTABLE_EXECUTABLE_FILE,
+    portableExe: process.env.PORTABLE_EXECUTABLE_FILE || '(not set)',
+    runningExe: app.getPath('exe'),
+    installedExe: installedExePath(),
+    logPath: updateLogPath(),
+    lastError: lastUpdateError || '(none)',
+    logTail,
+    platform: `${process.platform} ${os.release()}`,
+    electron: process.versions.electron,
+    node: process.versions.node,
+  };
+});
+
+ipcMain.handle('open-log-folder', () => {
+  const p = updateLogPath();
+  if (fs.existsSync(p)) shell.showItemInFolder(p);
+  else shell.openPath(path.dirname(p));
   return true;
 });
 
@@ -287,12 +406,14 @@ function createWindow() {
   mainWindow.removeMenu();
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
-    if (app.isPackaged) startUpdateScheduler();
+    if (app.isPackaged) {
+      cleanupAfterSwap();
+      startUpdateScheduler();
+    }
 
     // If we just came back from an auto-applied update, tell the renderer.
     const applied = consumePendingAppliedToast();
     if (applied && mainWindow && !mainWindow.isDestroyed()) {
-      // Delay slightly so the renderer has set up its onUpdateApplied listener.
       setTimeout(() => {
         mainWindow.webContents.send('update-applied', applied);
       }, 1500);

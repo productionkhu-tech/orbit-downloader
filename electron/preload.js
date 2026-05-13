@@ -32,4 +32,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   restartForUpdate: () => ipcRenderer.invoke('restart-for-update'),
   checkUpdateNow: () => ipcRenderer.invoke('check-update-now'),
+  getDebugInfo: () => ipcRenderer.invoke('get-debug-info'),
+  openLogFolder: () => ipcRenderer.invoke('open-log-folder'),
 });

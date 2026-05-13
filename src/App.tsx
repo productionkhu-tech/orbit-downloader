@@ -24,7 +24,7 @@ import {
   ArrowRight,
   Globe,
 } from 'lucide-react';
-import type { AppConfig, Quality, UpdateInfo, UpdateStatus } from './globals';
+import type { AppConfig, Quality, UpdateInfo, UpdateStatus, DebugInfo } from './globals';
 
 // ============================================================
 // URL parsing
@@ -312,6 +312,7 @@ function App() {
   const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ status: 'checking' });
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -499,9 +500,16 @@ function App() {
           <div className="flex items-baseline gap-2">
             <span className="text-[15px] font-semibold tracking-tight">Orbit</span>
             <span className="text-[12px] text-[#8B8579]">영상 다운로더</span>
-            <span className="text-[10px] text-[#A8A29E] font-mono tabular-nums">
+            <button
+              onClick={async () => {
+                const info = await window.electronAPI?.getDebugInfo();
+                if (info) setDebugInfo(info);
+              }}
+              title="클릭하여 진단 정보 보기"
+              className="text-[10px] text-[#A8A29E] font-mono tabular-nums hover:text-[#5C5A52] hover:underline transition-colors"
+            >
               v{__APP_VERSION__} · {__BUILD_DATE__}
-            </span>
+            </button>
           </div>
         </div>
 
@@ -771,6 +779,10 @@ function App() {
       </main>
 
       {/* ============ Toast ============ */}
+      {debugInfo && (
+        <DebugModal info={debugInfo} onClose={() => setDebugInfo(null)} />
+      )}
+
       {toast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-[fadeUp_0.2s_ease-out]">
           <div className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-[12.5px] font-medium border shadow-[0_8px_24px_rgba(31,30,27,0.12)] backdrop-blur ${
@@ -791,6 +803,84 @@ function App() {
 // ============================================================
 // Sub-components
 // ============================================================
+function DebugModal({ info, onClose }: { info: DebugInfo; onClose: () => void }) {
+  const summary =
+`Orbit Downloader 진단
+─────────────────────────────
+버전        v${info.version}
+플랫폼      ${info.platform}
+Electron    ${info.electron}
+Node        ${info.node}
+
+설치 정보
+─────────────────────────────
+Portable     ${info.portable ? 'yes' : 'no'}
+포터블 EXE   ${info.portableExe}
+실행 중 EXE  ${info.runningExe}
+업데이트 대상 ${info.installedExe}
+로그 파일    ${info.logPath}
+
+마지막 에러
+─────────────────────────────
+${info.lastError}
+
+최근 로그
+─────────────────────────────
+${info.logTail || '(없음)'}
+`;
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(summary); } catch (_) {}
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] bg-black/30 backdrop-blur-sm flex items-center justify-center p-6"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-2xl max-h-[80vh] bg-white rounded-2xl shadow-2xl border border-[#1F1E1B]/10 flex flex-col overflow-hidden"
+      >
+        <div className="px-5 py-4 border-b border-[#1F1E1B]/[0.06] flex items-center justify-between">
+          <div>
+            <h2 className="text-[14px] font-semibold text-[#1F1E1B]">진단 정보</h2>
+            <p className="text-[11.5px] text-[#8B8579] mt-0.5">문제 보고 시 아래 내용을 복사해 첨부해 주세요.</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 grid place-items-center rounded-md text-[#8B8579] hover:bg-[#1F1E1B]/[0.05] hover:text-[#1F1E1B] transition-colors"
+            title="닫기"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <pre className="flex-1 overflow-auto p-5 text-[11.5px] font-mono text-[#1F1E1B] leading-relaxed bg-[#F4F1E8]/40 whitespace-pre-wrap break-all">
+          {summary}
+        </pre>
+
+        <div className="px-5 py-3 border-t border-[#1F1E1B]/[0.06] flex items-center justify-end gap-2">
+          <button
+            onClick={() => window.electronAPI?.openLogFolder()}
+            className="h-9 px-3.5 rounded-lg bg-white border border-[#1F1E1B]/[0.1] text-[12px] font-medium text-[#5C5A52] hover:bg-[#1F1E1B]/[0.04] hover:text-[#1F1E1B] transition-colors flex items-center gap-1.5"
+          >
+            <FolderOpen size={13} />
+            로그 폴더 열기
+          </button>
+          <button
+            onClick={copy}
+            className="h-9 px-3.5 rounded-lg bg-[#D97757] hover:bg-[#C9633E] text-white text-[12px] font-semibold transition-colors flex items-center gap-1.5"
+          >
+            <Clipboard size={13} />
+            복사
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function UpdateBadge({
   status, pending, onRestart, onCheckNow,
 }: {
