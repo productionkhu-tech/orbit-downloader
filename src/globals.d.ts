@@ -7,6 +7,7 @@ export interface AppConfig {
   quality: Quality;
   audioOnly: boolean;
   subtitle: boolean;
+  compat: boolean;
   maxConcurrent: number;
 }
 
@@ -18,6 +19,7 @@ export interface DownloadParams {
   quality: Quality;
   audioOnly: boolean;
   subtitle: boolean;
+  compat: boolean;
 }
 
 export interface YtdlpCheck {

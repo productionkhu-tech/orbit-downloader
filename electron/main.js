@@ -500,7 +500,8 @@ ipcMain.handle('get-config', () => {
     quality: store.get('quality', 'best'),
     audioOnly: store.get('audioOnly', false),
     subtitle: store.get('subtitle', false),
-    maxConcurrent: store.get('maxConcurrent', 2),
+    compat: store.get('compat', true),
+    maxConcurrent: store.get('maxConcurrent', 3),
   };
 });
 
@@ -569,7 +570,7 @@ function sanitizeFilename(name) {
   return cleaned;
 }
 
-function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, referer }) {
+function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, referer, compat }) {
   const safeTitle = sanitizeFilename(title);
   // Title present → use as filename. Empty → let yt-dlp pick from video metadata.
   const outputTemplate = path.join(
@@ -604,21 +605,30 @@ function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, re
   if (audioOnly) {
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   } else {
+    // Height cap per quality preset ('' = no cap for "best").
+    const cap = quality === '1080' ? '[height<=1080]'
+      : quality === '720' ? '[height<=720]'
+      : quality === '480' ? '[height<=480]'
+      : '';
+
     let format;
-    switch (quality) {
-      case '1080':
-        format = 'bv*[height<=1080]+ba/b[height<=1080]/best';
-        break;
-      case '720':
-        format = 'bv*[height<=720]+ba/b[height<=720]/best';
-        break;
-      case '480':
-        format = 'bv*[height<=480]+ba/b[height<=480]/best';
-        break;
-      case 'best':
-      default:
-        format = 'bv*+ba/b';
-        break;
+    if (compat) {
+      // PowerPoint compatibility: STRONGLY prefer H.264 (avc1) video + AAC
+      // (mp4a) audio, which is the only codec combo PowerPoint reliably
+      // decodes. VP9 / AV1 play fine in media players but PowerPoint rejects
+      // them ("64비트 코덱" error). For ≤1080p every major site (YouTube, X,
+      // TikTok, Instagram) offers native H.264, so no re-encode is needed.
+      // The /bv*+ba fallback only triggers on AV1/VP9-only sources, which the
+      // post-download ensureCompatible() step then transcodes.
+      format =
+        `bv*[vcodec^=avc1]${cap}+ba[acodec^=mp4a]/` +
+        `bv*[vcodec^=avc1]${cap}+ba/` +
+        `b[vcodec^=avc1]${cap}/` +
+        `bv*${cap}+ba/b${cap}/best`;
+    } else {
+      format = cap
+        ? `bv*${cap}+ba/b${cap}/best`
+        : 'bv*+ba/b';
     }
     args.push('-f', format, '--merge-output-format', 'mp4');
   }
@@ -761,6 +771,25 @@ function extractStreamInfo(html) {
   return { stream, pageTitle };
 }
 
+// Watch stdout lines for the final output path.
+function trackFinalPath(line, state) {
+  let m = line.match(/\[Merger\]\s+Merging formats into\s+"([^"]+)"/);
+  if (m) { state.path = m[1].trim(); return; }
+  m = line.match(/\[ExtractAudio\]\s+Destination:\s+(.+)$/);
+  if (m) { state.path = m[1].trim(); return; }
+  m = line.match(/\[(?:Fixup\w+|VideoRemuxer|VideoConvertor)\].*?(?:to|into)\s+"?([A-Za-z]:\\[^"]+|\/[^"]+)"?/);
+  if (m) { state.path = m[1].trim(); return; }
+  m = line.match(/^\[download\]\s+Destination:\s+(.+)$/);
+  if (m) {
+    const p = m[1].trim();
+    // Ignore intermediate fragment files like "name.f399.mp4".
+    if (!/\.f\d+\.\w+$/.test(p)) state.path = p;
+    return;
+  }
+  m = line.match(/^\[download\]\s+(.+?)\s+has already been downloaded/);
+  if (m) { state.path = m[1].trim(); return; }
+}
+
 function spawnYtdlp(event, payload, urlOverride, refererOverride) {
   return new Promise((resolve) => {
     const { id } = payload;
@@ -774,8 +803,13 @@ function spawnYtdlp(event, payload, urlOverride, refererOverride) {
     activeDownloads.set(id, ytdlp);
 
     let stderrBuf = '';
+    const pathState = { path: '' };
     ytdlp.stdout.on('data', (data) => {
-      data.toString().split(/\r?\n/).forEach((line) => { if (line.trim()) send(line); });
+      data.toString().split(/\r?\n/).forEach((line) => {
+        if (!line.trim()) return;
+        trackFinalPath(line, pathState);
+        send(line);
+      });
     });
     ytdlp.stderr.on('data', (data) => {
       const text = data.toString();
@@ -785,14 +819,129 @@ function spawnYtdlp(event, payload, urlOverride, refererOverride) {
     ytdlp.on('error', (err) => {
       send(`[ERROR] yt-dlp 실행 실패: ${err.message}`);
       activeDownloads.delete(id);
-      resolve({ code: -1, cancelled: false, stderr: stderrBuf });
+      resolve({ code: -1, cancelled: false, stderr: stderrBuf, finalPath: pathState.path });
     });
     ytdlp.on('close', (code, signal) => {
       const cancelled = signal === 'SIGTERM' || signal === 'SIGKILL';
       activeDownloads.delete(id);
-      resolve({ code, cancelled, stderr: stderrBuf });
+      resolve({ code, cancelled, stderr: stderrBuf, finalPath: pathState.path });
     });
   });
+}
+
+// ---------------- PowerPoint compatibility (codec) ----------------
+function parseDurationSec(ffmpegStderr) {
+  const m = ffmpegStderr.match(/Duration:\s+(\d+):(\d+):(\d+\.?\d*)/);
+  if (!m) return 0;
+  return (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+}
+
+// Probe a media file. Returns { vcodec, acodec, channels, durationSec }.
+function probeMedia(filePath) {
+  return new Promise((resolve) => {
+    const ff = ffmpegPath();
+    if (!ff) return resolve(null);
+    let buf = '';
+    const p = spawn(ff, ['-hide_banner', '-i', filePath], { windowsHide: true });
+    p.stderr.on('data', (d) => { buf += d.toString(); });
+    p.on('error', () => resolve(null));
+    p.on('close', () => {
+      const v = buf.match(/Stream #\d+:\d+.*?:\s*Video:\s*(\w+)/);
+      const a = buf.match(/Stream #\d+:\d+.*?:\s*Audio:\s*(\w+)/);
+      const ch = buf.match(/Audio:.*?,\s*[\d.]+ Hz,\s*([^,]+),/);
+      resolve({
+        vcodec: v ? v[1].toLowerCase() : '',
+        acodec: a ? a[1].toLowerCase() : '',
+        channels: ch ? ch[1].trim() : '',
+        durationSec: parseDurationSec(buf),
+      });
+    });
+  });
+}
+
+// Re-encode to a PowerPoint-safe profile (H.264 High/yuv420p + AAC stereo).
+// Reports progress 0..100 via onProgress.
+function runFfmpegReencode(inPath, outPath, mode, durationSec, onProgress) {
+  return new Promise((resolve) => {
+    const ff = ffmpegPath();
+    if (!ff) return resolve(false);
+    const args = ['-y', '-hide_banner', '-i', inPath];
+    if (mode === 'video') {
+      args.push(
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-pix_fmt', 'yuv420p', '-profile:v', 'high',
+        '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+      );
+    } else {
+      // audio-only fix: keep H.264 video as-is, just normalize audio.
+      args.push('-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ac', '2');
+    }
+    args.push('-movflags', '+faststart', outPath);
+
+    const p = spawn(ff, args, { windowsHide: true });
+    p.stderr.on('data', (d) => {
+      const m = d.toString().match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+      if (m && durationSec > 0 && onProgress) {
+        const sec = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+        onProgress(Math.min(99, Math.floor((sec / durationSec) * 100)));
+      }
+    });
+    p.on('error', () => resolve(false));
+    p.on('close', (code) => resolve(code === 0));
+  });
+}
+
+// After a successful download, guarantee the file is PowerPoint-embeddable.
+async function ensureCompatible(event, id, filePath) {
+  const send = (text) => event.sender.send('download-progress', { id, text });
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return;
+    if (!/\.(mp4|mov|m4v|mkv|webm)$/i.test(filePath)) return;
+    const info = await probeMedia(filePath);
+    if (!info) return;
+
+    const videoOk = info.vcodec === 'h264';
+    const audioOk = info.acodec === 'aac' || info.acodec === '';
+    if (videoOk && audioOk) return; // already PowerPoint-safe
+
+    const mode = videoOk ? 'audio' : 'video';
+    send(
+      mode === 'video'
+        ? `[Orbit] PowerPoint 호환 변환 중 (${info.vcodec.toUpperCase()} → H.264)…`
+        : '[Orbit] PowerPoint 호환 변환 중 (오디오 AAC)…'
+    );
+
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath, path.extname(filePath));
+    const tmpOut = path.join(dir, `${base}.ppt-tmp.mp4`);
+    if (fs.existsSync(tmpOut)) { try { fs.unlinkSync(tmpOut); } catch (_) {} }
+
+    let lastPct = -1;
+    const ok = await runFfmpegReencode(filePath, tmpOut, mode, info.durationSec, (pct) => {
+      if (pct !== lastPct) {
+        lastPct = pct;
+        // Reuse the [download] progress format so the UI bar tracks it.
+        send(`[download] ${pct}.0% of ~100.00MiB (PowerPoint 변환)`);
+      }
+    });
+
+    if (ok && fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 0) {
+      const finalMp4 = path.join(dir, `${base}.mp4`);
+      try {
+        if (filePath !== finalMp4 && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        fs.renameSync(tmpOut, finalMp4);
+        send('[Orbit] PowerPoint 호환 변환 완료 ✓');
+      } catch (e) {
+        send(`[Orbit] 변환 파일 교체 실패: ${e.message} (원본은 유지됨)`);
+        try { fs.unlinkSync(tmpOut); } catch (_) {}
+      }
+    } else {
+      send('[Orbit] 변환 실패 — 원본 파일을 유지합니다.');
+      try { if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut); } catch (_) {}
+    }
+  } catch (e) {
+    send(`[Orbit] 호환성 검사 오류: ${e.message}`);
+  }
 }
 
 ipcMain.on('start-download', async (event, payload) => {
@@ -841,6 +990,13 @@ ipcMain.on('start-download', async (event, payload) => {
     } catch (e) {
       send(`[Orbit] 페이지 가져오기 실패: ${e.message}`);
     }
+  }
+
+  // PowerPoint-compatibility safety net: if the download succeeded and the user
+  // wants compat output (default), make sure the file is H.264/AAC. For ≤1080p
+  // this is a no-op (already H.264); only AV1/VP9-only sources get transcoded.
+  if (result.code === 0 && !result.cancelled && !payload.audioOnly && payload.compat) {
+    await ensureCompatible(event, id, result.finalPath);
   }
 
   event.sender.send('download-complete', {

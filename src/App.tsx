@@ -19,6 +19,7 @@ import {
   Folder,
   Headphones,
   Captions,
+  MonitorPlay,
   ArrowRight,
   Globe,
 } from 'lucide-react';
@@ -301,6 +302,7 @@ function App() {
     quality: 'best',
     audioOnly: false,
     subtitle: false,
+    compat: true,
     maxConcurrent: 3,
   });
   const [inputText, setInputText] = useState('');
@@ -371,6 +373,7 @@ function App() {
         quality: config.quality,
         audioOnly: config.audioOnly,
         subtitle: config.subtitle,
+        compat: config.compat,
       });
     });
     setDownloads((prev) =>
@@ -617,6 +620,13 @@ function App() {
           onClick={() => updateConfig('subtitle', !config.subtitle)}
           icon={<Captions size={12.5} />}
           label="자막 포함"
+        />
+        <InlineSwitch
+          active={config.compat}
+          onClick={() => updateConfig('compat', !config.compat)}
+          icon={<MonitorPlay size={12.5} />}
+          label="PPT 호환"
+          title="PowerPoint에 삽입 가능한 H.264 코덱으로 저장 (권장)"
         />
       </div>
 
@@ -941,13 +951,14 @@ function StatusPill({ children, tone }: { children: ReactNode; tone: 'accent' | 
 }
 
 function InlineSwitch({
-  active, onClick, icon, label,
-}: { active: boolean; onClick: () => void; icon: ReactNode; label: string }) {
+  active, onClick, icon, label, title,
+}: { active: boolean; onClick: () => void; icon: ReactNode; label: string; title?: string }) {
   return (
     <button
       onClick={onClick}
       role="switch"
       aria-checked={active}
+      title={title}
       className="group flex items-center gap-2 h-9 px-2.5 rounded-lg hover:bg-[#1F1E1B]/[0.035] transition-colors shrink-0"
     >
       <span className={`transition-colors ${active ? 'text-[#D97757]' : 'text-[#A8A29E]'}`}>
