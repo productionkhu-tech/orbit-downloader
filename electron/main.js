@@ -570,7 +570,14 @@ function sanitizeFilename(name) {
   return cleaned;
 }
 
-function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, referer, compat }) {
+function isYouTubeUrl(u) {
+  try {
+    const h = new URL(u).hostname.toLowerCase().replace(/^www\./, '');
+    return /(^|\.)youtube\.com$/.test(h) || h === 'youtu.be' || h === 'youtube-nocookie.com';
+  } catch { return false; }
+}
+
+function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, referer, compat, ytFallback }) {
   const safeTitle = sanitizeFilename(title);
   // Title present → use as filename. Empty → let yt-dlp pick from video metadata.
   const outputTemplate = path.join(
@@ -595,6 +602,18 @@ function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, re
     'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   ];
 
+  // YouTube throttles the format URLs served by some player clients, which
+  // surfaces as "unable to download video data: HTTP Error 403: Forbidden".
+  // Pass 1 (default,android): keeps high-res H.264 for normal videos.
+  // Pass 2 fallback (android only): only progressive 360p survives YouTube's
+  // PO-token throttling on copyrighted / radio-mix videos, but it always
+  // downloads — better 360p than a hard failure. The arg is namespaced to
+  // `youtube:` so it's ignored for every other site.
+  args.push(
+    '--extractor-args',
+    ytFallback ? 'youtube:player_client=android' : 'youtube:player_client=default,android',
+  );
+
   if (referer) {
     args.push('--add-header', `Referer:${referer}`);
   }
@@ -604,6 +623,11 @@ function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, re
 
   if (audioOnly) {
     args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+  } else if (ytFallback) {
+    // YouTube 403 fallback: progressive H.264 (format 18) is the only stream
+    // that survives PO-token throttling. It's a single muxed file (no merge),
+    // already H.264/AAC → PowerPoint-safe.
+    args.push('-f', '18/b[ext=mp4]/b', '--merge-output-format', 'mp4');
   } else {
     // Height cap per quality preset ('' = no cap for "best").
     const cap = quality === '1080' ? '[height<=1080]'
@@ -990,6 +1014,19 @@ ipcMain.on('start-download', async (event, payload) => {
     } catch (e) {
       send(`[Orbit] 페이지 가져오기 실패: ${e.message}`);
     }
+  }
+
+  // YouTube 403 retry: high-res DASH URLs get throttled on copyrighted / radio
+  // (RD…) videos. Retry once with the android progressive stream, which always
+  // downloads (360p). Better a lower-res file than a hard failure.
+  const got403 =
+    !result.cancelled &&
+    result.code !== 0 &&
+    /HTTP Error 403|Forbidden/i.test(result.stderr) &&
+    isYouTubeUrl(url);
+  if (got403) {
+    send('[Orbit] YouTube가 고화질을 차단했어요. 360p로 다시 시도합니다…');
+    result = await spawnYtdlp(event, { ...payload, ytFallback: true });
   }
 
   // PowerPoint-compatibility safety net: if the download succeeded and the user
