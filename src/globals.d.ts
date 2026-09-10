@@ -74,6 +74,8 @@ declare global {
       readClipboard: () => Promise<string>;
       openFolder: (folderPath: string) => Promise<string | null>;
       showFile: (filePath: string) => Promise<boolean>;
+      revealItem: (args: { filePath?: string; saveDirectory?: string }) =>
+        Promise<'file' | 'dir' | 'savedir' | 'none'>;
       checkYtdlp: () => Promise<YtdlpCheck>;
       startDownload: (params: DownloadParams) => void;
       cancelDownload: (id: string) => Promise<boolean>;

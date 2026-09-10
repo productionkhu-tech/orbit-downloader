@@ -272,12 +272,6 @@ function genId() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-function dirOf(filePath?: string) {
-  if (!filePath) return '';
-  const idx = Math.max(filePath.lastIndexOf('\\'), filePath.lastIndexOf('/'));
-  return idx > 0 ? filePath.slice(0, idx) : '';
-}
-
 function truncatePath(p: string, len = 32) {
   if (!p) return '';
   if (p.length <= len) return p;
@@ -452,11 +446,14 @@ function App() {
   };
   const removeOne = (id: string) => setDownloads((prev) => prev.filter((d) => d.id !== id));
   const openFolderOfItem = async (item: DownloadItem) => {
-    if (item.filePath) {
-      const ok = await window.electronAPI?.showFile(item.filePath);
-      if (!ok) await window.electronAPI?.openFolder(dirOf(item.filePath) || config.saveDirectory);
-    } else {
-      await window.electronAPI?.openFolder(config.saveDirectory);
+    const where = await window.electronAPI?.revealItem({
+      filePath: item.filePath,
+      saveDirectory: config.saveDirectory,
+    });
+    if (where === 'none') {
+      showToast('파일과 저장 폴더를 모두 찾지 못했어요', 'err');
+    } else if (where === 'savedir' || where === 'dir') {
+      showToast('원본 파일을 못 찾아 폴더만 열었어요', 'info');
     }
   };
   const clearFinished = () => {

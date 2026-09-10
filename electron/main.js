@@ -185,11 +185,61 @@ async function checkForUpdate() {
   }
 }
 
+// ---------------- yt-dlp self-update ----------------
+// The bundled yt-dlp ages badly: YouTube changes its anti-bot scheme every
+// few weeks and a stale binary starts returning 403 mid-download, which our
+// fallback then silently downgrades to 360p. Keeping yt-dlp fresh on its own
+// schedule means users stop hitting that without waiting for an app release.
+function currentYtdlpVersion() {
+  return new Promise((resolve) => {
+    let out = '';
+    try {
+      const p = spawn(ytdlpPath(), ['--version'], { windowsHide: true });
+      p.stdout.on('data', (d) => { out += d.toString(); });
+      p.on('error', () => resolve(''));
+      p.on('close', () => resolve(out.trim()));
+    } catch (_) { resolve(''); }
+  });
+}
+
+async function checkYtdlpUpdate() {
+  // Never swap the binary while a download is using it.
+  if (activeDownloads.size > 0) return;
+  try {
+    const res = await fetch('https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest', {
+      headers: { 'User-Agent': 'orbit-downloader', Accept: 'application/vnd.github+json' },
+    });
+    if (!res.ok) return;
+    const rel = await res.json();
+    const latest = String(rel.tag_name || '').trim();
+    const cur = await currentYtdlpVersion();
+    if (!latest || latest === cur) { ulog.info(`yt-dlp 최신 (${cur || '?'})`); return; }
+    const wanted = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+    const asset = (rel.assets || []).find((a) => a.name === wanted);
+    if (!asset) return;
+    ulog.info(`yt-dlp 업데이트 ${cur || '?'} → ${latest}`);
+    const dest = ytdlpUserPath();
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const tmp = dest + '.part';
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    await downloadToFile(asset.browser_download_url, tmp);
+    if (fs.statSync(tmp).size < 1024 * 1024) throw new Error('파일이 너무 작음');
+    if (fs.existsSync(dest)) fs.unlinkSync(dest);
+    fs.renameSync(tmp, dest);
+    ulog.info(`yt-dlp ${latest} 적용됨 → ${dest}`);
+  } catch (e) {
+    ulog.warn(`yt-dlp 업데이트 실패: ${e.message}`);
+  }
+}
+
 function startUpdateScheduler() {
   // First check 2 seconds after launch — fast enough to feel responsive,
   // late enough that the renderer has registered its listeners.
   setTimeout(checkForUpdate, 2_000);
   setInterval(checkForUpdate, UPDATE_CHECK_INTERVAL_MS);
+  // yt-dlp freshness matters more than app freshness — check it too.
+  setTimeout(checkYtdlpUpdate, 8_000);
+  setInterval(checkYtdlpUpdate, UPDATE_CHECK_INTERVAL_MS);
 }
 
 // Spawn a detached helper batch that, after this process exits, replaces the
@@ -381,13 +431,37 @@ ipcMain.handle('open-log-folder', () => {
 // ---------------- Bundled binaries ----------------
 // In dev, bin/ lives next to electron/. In a packaged app, electron-builder
 // puts it under resources/bin/.
+// yt-dlp writes stdout/stderr in the Windows console codepage (CP949 on
+// Korean systems), NOT UTF-8. Decoding those bytes as UTF-8 mangles every
+// path containing Korean, which is what broke "open file location" — the
+// mangled path failed fs.existsSync so the button silently did nothing.
+// Try UTF-8 first, fall back to CP949 when we see replacement characters.
+const _utf8Decoder = new TextDecoder('utf-8');
+let _cp949Decoder = null;
+try { _cp949Decoder = new TextDecoder('euc-kr'); } catch (_) { _cp949Decoder = null; }
+function decodeOut(buf) {
+  const s = _utf8Decoder.decode(buf);
+  if (!s.includes('�') || !_cp949Decoder) return s;
+  try { return _cp949Decoder.decode(buf); } catch (_) { return s; }
+}
+
 function binDir() {
   return app.isPackaged
     ? path.join(process.resourcesPath, 'bin')
     : path.join(__dirname, '..', 'bin');
 }
 
+// yt-dlp goes stale fast — YouTube breaks it every few weeks, which shows up
+// as 403 errors and silent quality downgrades (1080p -> 360p). We keep a
+// self-updated copy in userData and prefer it over the one baked into the EXE,
+// so YouTube breakage heals itself without shipping a new release.
+function ytdlpUserPath() {
+  return path.join(app.getPath('userData'), 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+}
+
 function ytdlpPath() {
+  const user = ytdlpUserPath();
+  if (fs.existsSync(user) && fs.statSync(user).size > 1024 * 1024) return user;
   const candidate = path.join(binDir(), process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
   return fs.existsSync(candidate) ? candidate : 'yt-dlp';
 }
@@ -531,6 +605,23 @@ ipcMain.handle('open-folder', (_e, folderPath) => {
   return null;
 });
 
+// Open the file's location. Degrades gracefully: exact file → its folder →
+// the configured save folder. Previously a mangled path made every step fail
+// silently, so the folder button appeared dead.
+ipcMain.handle('reveal-item', (_e, args) => {
+  const filePath = args && args.filePath;
+  const saveDirectory = args && args.saveDirectory;
+  try {
+    if (filePath && fs.existsSync(filePath)) { shell.showItemInFolder(filePath); return 'file'; }
+    const dir = filePath ? path.dirname(filePath) : '';
+    if (dir && fs.existsSync(dir)) { shell.openPath(dir); return 'dir'; }
+    if (saveDirectory && fs.existsSync(saveDirectory)) { shell.openPath(saveDirectory); return 'savedir'; }
+  } catch (e) {
+    ulog.warn(`reveal-item 실패: ${e.message}`);
+  }
+  return 'none';
+});
+
 ipcMain.handle('show-file', (_e, filePath) => {
   if (filePath && fs.existsSync(filePath)) {
     shell.showItemInFolder(filePath);
@@ -596,7 +687,6 @@ function buildArgs({ url, saveDirectory, title, quality, audioOnly, subtitle, re
     '--no-mtime',
     '--newline',
     '--progress',
-    '--restrict-filenames',
     '--no-warnings',
     '--add-header',
     'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -829,14 +919,14 @@ function spawnYtdlp(event, payload, urlOverride, refererOverride) {
     let stderrBuf = '';
     const pathState = { path: '' };
     ytdlp.stdout.on('data', (data) => {
-      data.toString().split(/\r?\n/).forEach((line) => {
+      decodeOut(data).split(/\r?\n/).forEach((line) => {
         if (!line.trim()) return;
         trackFinalPath(line, pathState);
         send(line);
       });
     });
     ytdlp.stderr.on('data', (data) => {
-      const text = data.toString();
+      const text = decodeOut(data);
       stderrBuf += text;
       text.split(/\r?\n/).forEach((line) => { if (line.trim()) send(line); });
     });

@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readClipboard: () => ipcRenderer.invoke('read-clipboard'),
   openFolder: (folderPath) => ipcRenderer.invoke('open-folder', folderPath),
   showFile: (filePath) => ipcRenderer.invoke('show-file', filePath),
+  revealItem: (args) => ipcRenderer.invoke('reveal-item', args),
   checkYtdlp: () => ipcRenderer.invoke('check-ytdlp'),
   startDownload: (params) => ipcRenderer.send('start-download', params),
   cancelDownload: (id) => ipcRenderer.invoke('cancel-download', id),
