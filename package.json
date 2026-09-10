@@ -11,13 +11,14 @@
     "build:installer": "node scripts/build-installer.mjs",
     "dev": "concurrently -k \"vite\" \"cross-env NODE_ENV=development electron .\"",
     "build:react": "tsc -b && vite build",
-    "build": "npm run build:icon && npm run fetch-bins && npm run build:react && electron-builder",
+    "build": "npm run build:icon && npm run fetch-bins && npm run build:react && npm run patch:builder && electron-builder",
     "pack": "npm run build:icon && npm run build:react && electron-builder --dir",
-    "dist": "npm run build:icon && npm run fetch-bins && npm run build:react && electron-builder",
-    "dist:portable": "npm run build:icon && npm run fetch-bins && npm run build:react && electron-builder --win portable",
-    "dist:installer": "npm run build:icon && npm run fetch-bins && npm run build:react && electron-builder --win nsis",
+    "dist": "npm run build:icon && npm run fetch-bins && npm run build:react && npm run patch:builder && electron-builder",
+    "dist:portable": "npm run build:icon && npm run fetch-bins && npm run build:react && npm run patch:builder && electron-builder --win portable",
+    "dist:installer": "npm run build:icon && npm run fetch-bins && npm run build:react && npm run patch:builder && electron-builder --win nsis",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "patch:builder": "node scripts/patch-builder.cjs"
   },
   "dependencies": {
     "electron-store": "^11.0.2",
