@@ -810,6 +810,42 @@ function scoreStreamUrl(url) {
   return 1000; // unknown: prefer over labeled-low but below explicit hi-res
 }
 
+// Pages serve UI sound effects and sprites as .mp4 too. A blind scan of the
+// HTML will happily grab one of those (Threads ships exactly one such file in
+// its shell), so skip the well-known static-asset paths.
+function isJunkMediaUrl(u) {
+  return /rsrc\.php|\/static\/|\/\/static\.|\/sprites?\//i.test(u);
+}
+
+// A download that exits 0 can still be junk — the scraper may have latched
+// onto that UI asset. If we asked for a video and the file has no video
+// stream, it is not the thing the user wanted.
+// A JS-only page's bare shell has nothing but the site's own name in its
+// <title>. Naming a file "Threads.mp4" tells the user nothing and collides
+// with every other post, so treat those as no title at all and let a later
+// tier supply a real one.
+function isUselessTitle(t) {
+  const v = (t || '').trim().toLowerCase().replace(/[\s_|·\-]+/g, ' ');
+  if (!v || v.length < 2) return true;
+  return [
+    'threads', 'instagram', 'facebook', 'x', 'twitter', 'tiktok', 'youtube',
+    'vimeo', 'reddit', 'video', 'videos', 'watch', 'home', 'loading',
+    'untitled', 'player', 'post', '동영상', '영상', '로딩', '게시물',
+  ].includes(v);
+}
+
+async function isUsableMedia(filePath, audioOnly) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    if (audioOnly) return fs.statSync(filePath).size > 16 * 1024;
+    const info = await probeMedia(filePath);
+    if (!info) return true; // can't probe — don't discard a possibly good file
+    return !!info.vcodec;
+  } catch (_) {
+    return true;
+  }
+}
+
 function extractStreamInfo(html) {
   // Many sites embed a JSON blob inside a JS string literal, so both slashes
   // and quotes are doubly escaped (`\/`, `\"`). Unescape so our regexes can
@@ -863,7 +899,9 @@ function extractStreamInfo(html) {
   const labeled = [];
   let mm;
   while ((mm = labelRegex.exec(normalized)) !== null) {
-    labeled.push({ label: mm[1], url: mm[2], score: scoreLabel(mm[1]) });
+    if (!isJunkMediaUrl(mm[2])) {
+      labeled.push({ label: mm[1], url: mm[2], score: scoreLabel(mm[1]) });
+    }
   }
 
   let stream = null;
@@ -873,7 +911,7 @@ function extractStreamInfo(html) {
   } else {
     // Stage 2: blind URL scan + URL-suffix heuristic
     const re = /https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mpd|mp4)(?:\?[^\s"'<>\\]*)?/gi;
-    const candidates = [...new Set(normalized.match(re) || [])];
+    const candidates = [...new Set(normalized.match(re) || [])].filter((u) => !isJunkMediaUrl(u));
     const pickBest = (filter) => {
       const filtered = candidates.filter(filter);
       if (filtered.length === 0) return null;
@@ -885,6 +923,8 @@ function extractStreamInfo(html) {
       pickBest((u) => /\.mp4(\?|$)/i.test(u)) ||
       null;
   }
+
+  if (isUselessTitle(pageTitle)) pageTitle = '';
 
   return { stream, pageTitle };
 }
@@ -1190,6 +1230,19 @@ ipcMain.on('start-download', async (event, payload) => {
           send(`[Orbit] 페이지 제목 사용: ${pageTitle}`);
         }
         result = await spawnYtdlp(event, { ...payload, title: titleForFile }, stream, url);
+
+        // Exit code 0 is not proof we got the video. Scrapers can latch onto a
+        // UI sound effect served as .mp4 (this is exactly what Threads did:
+        // a 436KB audio-only file named "Threads.mp4"). If the file has no
+        // video stream, bin it and let the browser tier try for real.
+        if (result.code === 0 && !result.cancelled &&
+            !(await isUsableMedia(result.finalPath, payload.audioOnly))) {
+          send('[Orbit] 받은 파일에 영상이 없어요 (페이지 UI 파일로 보입니다). 브라우저로 다시 시도합니다…');
+          try {
+            if (result.finalPath && fs.existsSync(result.finalPath)) fs.unlinkSync(result.finalPath);
+          } catch (_) {}
+          result = { ...result, code: -1 };
+        }
       } else {
         send('[Orbit] HTML에 영상 주소가 없어요. JS로 불러오는 페이지일 수 있습니다.');
       }
@@ -1212,6 +1265,11 @@ ipcMain.on('start-download', async (event, payload) => {
       if (viaBrowser.stream) {
         send(`[Orbit] 발견${viaBrowser.viaNetwork ? ' (네트워크 감청)' : ''}: ${viaBrowser.stream.slice(0, 110)}`);
         const userTitle = (payload.title || '').trim();
+        // A shell title here means the page never gave us real metadata. The
+        // post ID still beats a CDN hash for a filename.
+        if (isUselessTitle(viaBrowser.title)) {
+          viaBrowser.title = urlIdSuffix(url).trim();
+        }
         const titleForFile = userTitle || viaBrowser.title || '';
         if (!userTitle && viaBrowser.title) {
           send(`[Orbit] 제목 사용: ${viaBrowser.title}`);
