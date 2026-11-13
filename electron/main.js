@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Notification } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Notification, session } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Store from 'electron-store';
@@ -12,6 +12,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const store = new Store();
+
+// Hidden-browser extraction needs videos to start on their own — without this
+// Chromium refuses to autoplay and video.currentSrc stays empty.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 let mainWindow;
 const activeDownloads = new Map();
@@ -904,6 +908,105 @@ function trackFinalPath(line, state) {
   if (m) { state.path = m[1].trim(); return; }
 }
 
+// ---------------- Tier 3: hidden-browser extraction ----------------
+// Some sites (Threads, and other JS-only players) ship a bare shell to any
+// plain HTTP fetch — the page has no video data until its JavaScript runs.
+// yt-dlp says "Unsupported URL" and the static HTML scrape finds nothing.
+//
+// We're an Electron app, so we already carry a full Chromium: render the page
+// in a locked-down hidden window and read whatever is actually playing. The
+// window is sandboxed, gets a throwaway in-memory session, can't open other
+// windows, and only two strings (a URL and a title) ever come back out.
+function mediaScore(u) {
+  if (/\.m3u8(\?|$)/i.test(u)) return 3; // HLS manifest: all qualities
+  if (/\.mpd(\?|$)/i.test(u)) return 2;  // DASH manifest
+  return 1;                                // plain file
+}
+
+// Mirror yt-dlp's "[id]" convention so two posts can't collide.
+function urlIdSuffix(pageUrl) {
+  try {
+    const segs = new URL(pageUrl).pathname.split('/').filter(Boolean);
+    const last = segs[segs.length - 1] || '';
+    return /^[A-Za-z0-9_-]{5,40}$/.test(last) ? ` [${last}]` : '';
+  } catch (_) { return ''; }
+}
+
+async function extractViaBrowser(pageUrl, timeoutMs = 25_000) {
+  if (!/^https?:\/\//i.test(pageUrl)) return { stream: null, title: '' };
+
+  const part = session.fromPartition('orbit-extract-' + Date.now()); // in-memory
+  const media = [];
+  try {
+    part.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (d, cb) => {
+      if (/\.(m3u8|mpd|mp4)(\?|$)/i.test(d.url) && !/rsrc\.php|\/static\//i.test(d.url)) {
+        media.push(d.url);
+      }
+      cb({});
+    });
+  } catch (e) { ulog.warn(`webRequest hook 실패: ${e.message}`); }
+
+  let win = null;
+  let info = null;
+  try {
+    win = new BrowserWindow({
+      show: false,
+      width: 1280,
+      height: 900,
+      webPreferences: {
+        session: part,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        images: false, // we only need the media URL, skip the pictures
+      },
+    });
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    await win.loadURL(pageUrl);
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 800));
+      if (!win || win.isDestroyed()) break;
+      try {
+        info = await win.webContents.executeJavaScript(
+          '(() => { const vs=[...document.querySelectorAll("video")];' +
+          ' return { srcs: vs.map(v=>v.currentSrc||v.src).filter(Boolean),' +
+          ' title: document.title || "",' +
+          ' og: (document.querySelector(\'meta[property="og:title"]\')||{}).content || "" }; })()'
+        );
+      } catch (_) { /* still navigating — try again */ }
+      if (info && info.srcs.some((x) => /^https?:/i.test(x))) break;
+      if (info && media.length) break;
+    }
+  } catch (e) {
+    ulog.warn(`브라우저 추출 실패: ${e.message}`);
+  } finally {
+    try { if (win && !win.isDestroyed()) win.destroy(); } catch (_) {}
+  }
+
+  // A blob: currentSrc means MSE — the bytes never had a plain URL, so fall
+  // back to whatever manifest/file the page actually requested.
+  const httpSrc = info && info.srcs.find((x) => /^https?:/i.test(x));
+  const best = media.slice().sort((a, b) => mediaScore(b) - mediaScore(a))[0];
+  const stream = httpSrc || best || null;
+
+  // Build a filename: "@author - post text [id]".
+  let title = '';
+  if (info) {
+    const post = String(info.title || '').replace(/\s+/g, ' ').trim();
+    const handle = (String(info.og || '').match(/@([A-Za-z0-9._]+)/) || [])[1] || '';
+    const body = post.slice(0, 80).trim();
+    title = [handle, body].filter(Boolean).join(' - ') + urlIdSuffix(pageUrl);
+    title = title.trim();
+  }
+  return { stream, title, viaNetwork: !httpSrc && !!best };
+}
+
 function spawnYtdlp(event, payload, urlOverride, refererOverride) {
   return new Promise((resolve) => {
     const { id } = payload;
@@ -1073,10 +1176,12 @@ ipcMain.on('start-download', async (event, payload) => {
     /Unsupported URL|Unable to extract|Unable to download webpage|no suitable extractor/i.test(result.stderr);
 
   if (looksUnsupported) {
+    // Tier 2: pull a stream URL straight out of the page HTML. Fast, no browser.
+    let scrapedHtml = '';
     send('[Orbit] 페이지에서 스트림 URL을 직접 찾는 중…');
     try {
-      const html = await fetchPage(url);
-      const { stream, pageTitle } = extractStreamInfo(html);
+      scrapedHtml = await fetchPage(url);
+      const { stream, pageTitle } = extractStreamInfo(scrapedHtml);
       if (stream) {
         send(`[Orbit] 발견: ${stream}`);
         const userTitle = (payload.title || '').trim();
@@ -1086,23 +1191,47 @@ ipcMain.on('start-download', async (event, payload) => {
         }
         result = await spawnYtdlp(event, { ...payload, title: titleForFile }, stream, url);
       } else {
-        // Distinguish "stream URL is hidden because the content is gated" from
-        // "page has no recognizable video data at all".
+        send('[Orbit] HTML에 영상 주소가 없어요. JS로 불러오는 페이지일 수 있습니다.');
+      }
+    } catch (e) {
+      send(`[Orbit] 페이지 가져오기 실패: ${e.message}`);
+    }
+
+    // Tier 3: render the page in a hidden browser and take whatever is playing.
+    // This is what makes JS-only sites (Threads etc.) work — their HTML is an
+    // empty shell until the scripts run.
+    if (result.code !== 0 && !result.cancelled) {
+      send('[Orbit] 브라우저로 페이지를 열어 재생 중인 주소를 찾는 중…');
+      let viaBrowser = { stream: null, title: '' };
+      try {
+        viaBrowser = await extractViaBrowser(url);
+      } catch (e) {
+        send(`[Orbit] 브라우저 추출 실패: ${e.message}`);
+      }
+
+      if (viaBrowser.stream) {
+        send(`[Orbit] 발견${viaBrowser.viaNetwork ? ' (네트워크 감청)' : ''}: ${viaBrowser.stream.slice(0, 110)}`);
+        const userTitle = (payload.title || '').trim();
+        const titleForFile = userTitle || viaBrowser.title || '';
+        if (!userTitle && viaBrowser.title) {
+          send(`[Orbit] 제목 사용: ${viaBrowser.title}`);
+        }
+        result = await spawnYtdlp(event, { ...payload, title: titleForFile }, viaBrowser.stream, url);
+      } else {
+        // Every tier failed — now say why, as precisely as the page allows.
         const gatedSignals = [
           /"streams"\s*:\s*"\$undefined"/i,
           /restrictedContent|paywall|paid[_\-]?content|premium[_\-]?only/i,
           /로그인.{0,30}(필요|해야|이후|후에)|회원.{0,30}(가입|로그인|전용)|구독.{0,30}(필요|전용)|PRO.{0,30}(전용|회원)/i,
           /이\s*컨텐츠는\s*현재\s*이\s*코너에서만/i,
         ];
-        const isGated = gatedSignals.some((re) => re.test(html));
+        const isGated = scrapedHtml && gatedSignals.some((rx) => rx.test(scrapedHtml));
         if (isGated) {
           send('[ERROR] 이 영상은 무료로 받을 수 없는 콘텐츠입니다 (로그인·구독·코너 제한). 사이트에서 직접 확인하세요.');
         } else {
-          send('[Orbit] 페이지 HTML에서 영상 스트림을 찾지 못했습니다.');
+          send('[ERROR] 이 페이지에서 영상을 찾지 못했습니다. 로그인이 필요하거나, 재생 방식이 지원되지 않는 영상일 수 있어요.');
         }
       }
-    } catch (e) {
-      send(`[Orbit] 페이지 가져오기 실패: ${e.message}`);
     }
   }
 
